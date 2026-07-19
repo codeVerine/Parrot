@@ -1,0 +1,35 @@
+export type AdapterMode = "production" | "development";
+
+export type AdapterConfig = {
+  protocol: number;
+  schemaVersion: number;
+  requiredIntegrations: string[];
+  mode: AdapterMode;
+  turnDeadlineMs: number;
+  graceTimerMs: number;
+  artifactSizeLimitBytes: number;
+  watchDebounceMs: number;
+  reconnectBackoffMs: number[];
+  operationTimeoutMs: number;
+  pollIntervalMs: number;
+  supportedProviders: string[];
+};
+
+export const DEFAULT_CONFIG: AdapterConfig = {
+  protocol: 16,
+  schemaVersion: 1,
+  requiredIntegrations: ["claude", "codex"],
+  mode: "production",
+  turnDeadlineMs: 120_000,
+  graceTimerMs: 5_000,
+  artifactSizeLimitBytes: 4 * 1024 * 1024,
+  watchDebounceMs: 50,
+  reconnectBackoffMs: [100, 250, 1_000],
+  operationTimeoutMs: 10_000,
+  pollIntervalMs: 250,
+  supportedProviders: ["claude", "codex", "gemini"],
+};
+
+export function withConfig(overrides: Partial<AdapterConfig> = {}): AdapterConfig {
+  return { ...DEFAULT_CONFIG, ...overrides, requiredIntegrations: overrides.requiredIntegrations ?? [...DEFAULT_CONFIG.requiredIntegrations], reconnectBackoffMs: overrides.reconnectBackoffMs ?? [...DEFAULT_CONFIG.reconnectBackoffMs], supportedProviders: overrides.supportedProviders ?? [...DEFAULT_CONFIG.supportedProviders] };
+}
