@@ -22,6 +22,10 @@ The approved v1 event catalog is exactly: `TurnCompleted`, `TurnFailed`, `AgentT
 
 Zod schemas cover planner proposals, reviewer objections, resolution verification, frontier reports, implementation results, and objection merges. Role results are encoded as TOON and validated at the LLM boundary. Natural-language fields are data, never executable orchestration instructions.
 
+The canonical TOON codec lives in `packages/contracts/src/toon/` and is
+consumed by the root orchestrator and persistence package. There is no second
+platform TOON dialect.
+
 ## 6. Runtime signals
 
 Signals are observations, not platform events. The common envelope has a unique `signalId`, `observedAt`, source (`herdr_event`, `fs_watch`, `deadline_timer`, `reconcile`, or `adapter_internal`), and nullable workflow, iteration, turn, and agent correlations.

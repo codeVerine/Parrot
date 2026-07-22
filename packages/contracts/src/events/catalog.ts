@@ -49,7 +49,15 @@ export const EventSchemas = {
   BudgetCapReached: event("BudgetCapReached", { cap: z.number().nonnegative() }),
   IterationCapReached: event("IterationCapReached", { cap: z.number().int().positive() }),
   OrphanResultSeen: event("OrphanResultSeen", { artifactPath: z.string().min(1), contentHash: z.string().min(1) }),
-  UsageRecorded: event("UsageRecorded", { inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), cost: z.number().nonnegative() }),
+  UsageRecorded: event("UsageRecorded", {
+    messageId: z.string().min(1),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cost: z.number().nonnegative(),
+    provider: z.string().min(1).optional(),
+    cacheTokens: z.number().int().nonnegative().optional(),
+    pricingVersion: z.string().min(1).optional(),
+  }),
   VerificationCompleted: event("VerificationCompleted", {
     attempt: z.number().int().positive(),
     outcome: z.enum(["passed", "failed"]),
