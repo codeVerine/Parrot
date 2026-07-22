@@ -20,7 +20,7 @@ The approved v1 event catalog is exactly: `TurnCompleted`, `TurnFailed`, `AgentT
 
 ## 5. Role result schemas
 
-Zod schemas cover planner proposals, reviewer objections, resolution verification, frontier reports, implementation results, and objection merges. Role results are encoded as TOON and validated at the LLM boundary. Natural-language fields are data, never executable orchestration instructions.
+Zod schemas cover planner proposals, reviewer objections, resolution verification, frontier reports, implementation results, and objection merges. The merge result schema includes cluster proposals with `representativeClaim` and optional `mergeRationale`; cluster severity is recomputed deterministically as member maximum by Phase 5 post-processing (LLM-emitted severity is ignored). Role results are encoded as TOON and validated at the LLM boundary. Natural-language fields are data, never executable orchestration instructions.
 
 The canonical TOON codec lives in `packages/contracts/src/toon/` and is
 consumed by the root orchestrator and persistence package. There is no second
