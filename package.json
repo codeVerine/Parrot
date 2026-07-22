@@ -6,7 +6,9 @@
   "packageManager": "pnpm@10.13.1",
   "scripts": {
     "orchestrate": "tsx src/orchestrate.ts",
-    "typecheck": "tsc --noEmit"
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm run build && pnpm -r run typecheck && tsc --noEmit",
+    "test": "pnpm -r run test"
   },
   "dependencies": {
     "@platform/contracts": "workspace:*",
