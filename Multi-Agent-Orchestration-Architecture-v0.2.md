@@ -2,7 +2,7 @@
 
 **Version:** 0.2 (Draft)
 
-**Changes from 0.1:** Incorporates verified Herdr 0.7.3 (protocol 16) capabilities, replaces numeric consensus with objection tracking, replaces pane reading with turn-scoped result artifacts, adds durable event log, defines the turn protocol, merges the Decision Engine into the Workflow Engine, and resolves most of the v0.1 open questions.
+**Changes from 0.1:** Incorporates verified Herdr 0.7.3 (protocol 16) capabilities, replaces numeric consensus with objection tracking, replaces pane reading with turn-scoped TOON result artifacts, adds durable event log, defines the turn protocol, merges the Decision Engine into the Workflow Engine, and resolves most of the v0.1 open questions.
 
 ## 1. Vision
 
@@ -33,14 +33,15 @@ Primary goals:
 Workflow execution is deterministic. Waiting, retries, routing, state
 transitions, persistence, and dashboard generation never require an
 LLM. LLMs are called only for semantic reasoning, and every LLM
-boundary produces schema-validated JSON.
+boundary produces schema-validated TOON unless an external contract
+requires another format.
 
 ## Result artifacts over runtime status
 
 Pane output and runtime status are observability hints, not
 orchestration inputs. For Claude Code, Codex, and Gemini, Herdr status
 derives from screen-manifest heuristics even with integrations
-installed. Orchestration consumes turn-scoped, schema-validated result
+installed. Orchestration consumes turn-scoped, schema-validated TOON
 artifacts written by agents to known paths. Provider session logs are
 retained as audit evidence and parsed only by versioned adapters.
 
@@ -172,7 +173,7 @@ Every agent interaction is a turn with a stable identity:
 
     runs/<workflowId>/<iterationId>/<turnId>/
       prompt.md        (immutable, hash-identified)
-      result.json      (written by the agent)
+      result.toon      (written by the agent)
       repair-prompt.md (only if repair was needed)
 
 Protocol:
@@ -184,23 +185,24 @@ Protocol:
    artifacts. Each turn also receives a random nonce that must be echoed
    in the result envelope.
 2. **Adapter** sends one short instruction via `agent.send`: read the
-   prompt file, respond by writing `result.json` at the given path,
+   prompt file, respond by writing `result.toon` at the given path,
    matching the given output schema. `send` returns a
    `DeliveryReceipt` correlated to the turn.
 3. Agents write results atomically: write `result.tmp`, fsync/close if
-   available, then rename to `result.json`. Partial files are ignored.
+   available, then rename to `result.toon`. Partial files are ignored.
    The result envelope includes `workflowId`, `iterationId`, `turnId`,
    `schemaVersion`, and the turn nonce. A result whose envelope does not
    match the active turn is rejected.
-4. **Adapter** watches for `result.json` (fs watch), subscribes to
+4. **Adapter** watches for `result.toon` (fs watch), subscribes to
    `pane_agent_status_changed` as an accelerator hint, and starts the
    turn deadline timer.
-5. `result.json` appears: the adapter rejects symlinks, unexpected file
+5. `result.toon` appears: the adapter rejects symlinks, unexpected file
    ownership, world-writable artifact directories, stale mtimes, path
    escapes, and oversized files before parsing. The artifact hash is
-   recorded before validation. **Extraction & Validation** parses it
-   with Zod. On failure, exactly one bounded repair prompt is sent. A
-   second failure emits `TurnFailed`.
+   recorded before validation. **Extraction & Validation** parses TOON
+   into structured data and validates it with Zod. On failure, exactly
+   one bounded repair prompt is sent. A second failure emits
+   `TurnFailed`.
 6. A `working → idle` or `working → done` transition without a result
    file triggers an early result check, then a short grace timer, then
    `TurnFailed`. It is a completion candidate, never proof.
@@ -330,12 +332,14 @@ explosion cannot occur on the review path.
 
 ## 6.5 Extraction & Validation
 
-Owns every LLM output boundary. Zod schemas for each artifact type,
-one bounded repair attempt, then `TurnFailed`. No markdown or free text
-ever crosses an internal boundary. Natural-language fields inside JSON
-are still treated as untrusted data: prompt builders quote them as
-evidence, dashboards render them with escaping, and no downstream prompt
-may paste reviewer prose as executable instruction text.
+Owns every LLM output boundary. TOON is the default artifact format for
+agent results and local workflow artifacts; Zod schemas validate the
+parsed data for each artifact type. One bounded repair attempt, then
+`TurnFailed`. No markdown, JSON, or free text ever crosses an internal
+LLM boundary. Natural-language fields inside TOON are still treated as
+untrusted data: prompt builders quote them as evidence, dashboards
+render them with escaping, and no downstream prompt may paste reviewer
+prose as executable instruction text.
 
 ## 6.6 Objection Engine
 
@@ -343,17 +347,15 @@ Replaces the v0.1 numeric consensus. Consensus scores from LLMs are
 uncalibrated pseudo-precision; routing on them is routing on noise.
 Instead, reviews produce structured objections:
 
-``` json
-{
-  "id": "OBJ-042",
-  "dimension": "performance",
-  "severity": "blocking",
-  "claim": "The 2000ms buffer causes visible latency on seek.",
-  "evidence": ["src/player/buffer.ts:120", "requirement REQ-14"],
-  "status": "open",
-  "raisedBy": "reviewer-codex",
-  "turnId": "..."
-}
+``` toon
+id: OBJ-042
+dimension: performance
+severity: blocking
+claim: The 2000ms buffer causes visible latency on seek.
+evidence[2]: "src/player/buffer.ts:120","requirement REQ-14"
+status: open
+raisedBy: reviewer-codex
+turnId: ...
 ```
 
 ``` ts
@@ -376,7 +378,9 @@ Rules:
 
 - Objections require evidence (code references, requirement references,
   reproduction steps) or an explicit `evidence_missing` marker.
-- The gate is deterministic: zero open `blocking` objections.
+- The consensus gate is deterministic: zero open objections of any
+  severity. Human approval may still waive open objections explicitly,
+  but that path is approval-with-objections, not consensus.
 - Confidence values may be attached as metadata but never close an
   objection and never satisfy a gate.
 - The planner must respond to objection IDs; a reviewer (fresh session)
@@ -395,8 +399,8 @@ under the same evidence requirements.
 
 ## 6.7 Frontier Review
 
-Runs after the objection gate passes. Input: final proposal, objection
-history, unresolved minors. Output (JSON): implementation readiness,
+Runs after the objection gate passes. Input: final proposal and
+objection history. Output (TOON): implementation readiness,
 remaining risks, questions for the human, executive summary. Blocking
 findings do not stall in the report; they convert to objections and
 re-enter the loop, bounded by the iteration cap. Contradictions between
@@ -407,9 +411,11 @@ not summary footnotes.
 
 ## 6.8 Dashboard
 
-Consumes JSON only; never depends on an LLM. Shows summary, open and
-resolved objections, decisions, timeline, cost, and approve/reject with
-comments. Every claim supports drill-down along the durable chain:
+Consumes structured read models only; never depends on an LLM. The
+dashboard may render TOON-backed artifacts, SQLite projections, or API
+DTOs, but it never consumes raw chat prose as data. Shows summary, open
+and resolved objections, decisions, timeline, cost, and approve/reject
+with comments. Every claim supports drill-down along the durable chain:
 
     summary → objection → decision → evidence → transcript reference
 
@@ -432,6 +438,11 @@ SQLite (WAL mode) as source of truth. Tables:
 - objections, decisions, human_feedback
 - artifacts (prompt/result paths + hashes)
 - usage_ledger
+
+Where persistence needs opaque structured payloads, TOON is preferred
+over JSON unless the database, API boundary, or integration requires
+JSON. File-backed workflow state, approval metadata, and import/export
+artifacts use `.toon` by default.
 
 Requirements are first-class because objections and decisions depend on
 stable references. Imported requirements store source path, content
@@ -495,19 +506,16 @@ through this escalation path.
 Store decisions, not chat logs (transcripts remain as audit evidence,
 referenced by hash):
 
-``` json
-{
-  "decision": "Buffer size",
-  "chosen": "2000ms",
-  "alternatives": ["500ms", "1000ms"],
-  "reason": "Reduced underruns.",
-  "confidence": 0.96,
-  "provenance": {
-    "workflowId": "...",
-    "turnId": "...",
-    "objections": ["OBJ-042"]
-  }
-}
+``` toon
+decision: Buffer size
+chosen: 2000ms
+alternatives[2]: 500ms,1000ms
+reason: Reduced underruns.
+confidence: 0.96
+provenance:
+  workflowId: ...
+  turnId: ...
+  objections[1]: OBJ-042
 ```
 
 Decisions carry provenance: which agent, which iteration, which
@@ -545,7 +553,7 @@ management decision.
 | Cost runaway | Usage ledger + per-workflow budget caps |
 | Screen-manifest drift after agent UI updates | Herdr manifest updates (`manifest_check`), plus the platform's independence from status accuracy |
 | Artifact tampering or stale result files | Nonce-bound result envelopes, atomic writes, canonical path checks, hashes before parse, late results recorded as orphans |
-| Prompt injection through structured JSON fields | Treat natural-language fields as quoted evidence, escape dashboard rendering, never paste reviewer prose as instructions |
+| Prompt injection through structured TOON fields | Treat natural-language fields as quoted evidence, escape dashboard rendering, never paste reviewer prose as instructions |
 | Replay/recovery divergence | Persist runtime signals and platform events separately; recovery tests kill/restart mid-turn and require the same folded state |
 | Missing integrations in local development | Production fails closed; explicit development mode can run with restore/session-log features disabled |
 
@@ -554,7 +562,7 @@ management decision.
 # 11. Resolved Questions (from v0.1)
 
 1. **How should consensus be measured?** Not by scores. Zero open
-   blocking objections, with objection lifecycle tracking.
+   objections of any severity, with objection lifecycle tracking.
 2. **Independent or sequential reviewers?** Independent first round to
    avoid anchoring; later rounds see the merged objection state to
    converge.
@@ -567,7 +575,7 @@ management decision.
    `ImplementationBlocked` escalation with a structured deviation
    request. Never silent workarounds.
 6. **Human intervention threshold?** Any of: iteration cap reached with
-   open blocking objections, budget cap reached, frontier review flags,
+   open objections, budget cap reached, frontier review flags,
    or explicit `AgentBlocked`/`ImplementationBlocked` without a rule.
 7. **Decisions as long-term knowledge base?** Yes; the provenance model
    in §8 is designed for it. Cross-project reuse remains future work.
@@ -605,7 +613,7 @@ management decision.
 The contracts are the architecture. Define, in order:
 
 1. Event schema (platform events, IDs, correlation fields).
-2. Turn artifact contracts: prompt file header, result schemas per role
+2. Turn artifact contracts: prompt file header, TOON result schemas per role
    (proposal, review/objections, frontier report), repair protocol.
 3. Objection and decision schemas (this document's §6.6 and §8 as the
    starting point).

@@ -4,6 +4,7 @@ import { watch } from "node:fs";
 import { dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { z } from "zod";
+import { parseToon } from "@platform/contracts";
 import { schemaForRole, type Role, type TurnIdentity } from "./schemas.js";
 
 export type WaitOutcome<T> =
@@ -80,12 +81,12 @@ async function tryReadResult<T>(
 
   let raw: unknown;
   try {
-    raw = JSON.parse(await readFile(resultPath, "utf8"));
+    raw = parseToon(await readFile(resultPath, "utf8"));
   } catch (error) {
     return {
       ok: false,
       reason: "invalid",
-      message: `Result is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      message: `Result is not valid TOON: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 

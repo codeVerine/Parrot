@@ -8,8 +8,8 @@ AI agents in Herdr:
 
 The MVP replaces manual copy/paste between the two panes. It sends each
 agent a short instruction pointing to a prompt file, waits for a
-turn-scoped `result.json`, tracks objections, and pauses for a human
-decision after every review round.
+turn-scoped `result.toon`, tracks objections, and keeps the
+planner-reviewer loop moving until consensus or the iteration cap.
 
 The full architecture is described in
 `Multi-Agent-Orchestration-Architecture-v0.2.md`. This implementation is
@@ -23,18 +23,23 @@ only the file-backed MVP from the local plan.
 - Prompt files for planner and reviewer turns.
 - Turn identity with `{ runId, iteration, role, turnId }`.
 - Result validation with Zod.
-- Freshness checks so stale `result.json` files are rejected.
-- One repair prompt after invalid JSON.
-- Append-only objection registry in `runs/<runId>/state.json`.
+- Freshness checks so stale `result.toon` files are rejected.
+- One repair prompt after invalid TOON.
+- Append-only objection registry in `runs/<runId>/state.toon`.
 - Atomic state writes using `state.tmp` then rename.
-- Human gate after every round, including consensus rounds.
+- Human gate only after consensus or the iteration cap.
+- Approved plans copied to `approved-plans/<task-slug>-<runId>/`.
 - Herdr notification when a round completes.
+- Reusable `@platform/persistence` package with SQLite WAL storage, an
+  append-only event log, transactional outbox dispatch, recovery, and replay.
+- Reusable `@platform/workflow-engine` package with deterministic turn and
+  planning reducers, pure guards, usage/budget fold, orphan handling, and
+  persistence-backed recovery.
 
 ## What Is Not Implemented Yet
 
-- SQLite persistence.
-- Durable event log.
-- XState workflow engine.
+- The bootstrap CLI has not yet migrated its file-backed state to the new
+  persistence package.
 - Dashboard.
 - Frontier review.
 - Worktree orchestration.
@@ -96,9 +101,17 @@ The orchestrator intentionally fails if either role resolves to zero or
 multiple agents. The error prints current candidates and the rename
 command to use.
 
-## Create A Task File
+## Provide Task Input
 
-Create a markdown file describing the task for the planner.
+Parrot accepts task input as an inline prompt, a readable file, or both.
+
+Inline prompt:
+
+```bash
+pnpm orchestrate "Design the SQLite persistence layer for Parrot."
+```
+
+Task file:
 
 Example:
 
@@ -109,16 +122,29 @@ Multi-Agent-Orchestration-Architecture-v0.2.md.
 EOF
 ```
 
+```bash
+pnpm orchestrate task.md
+```
+
+Task file plus additional prompt:
+
+```bash
+pnpm orchestrate task.md "Also account for migration from the current TOON state files."
+```
+
+When both are provided, Parrot combines the file content and inline
+prompt before sending the planner turn.
+
 ## Run
 
 ```bash
-pnpm exec tsx src/orchestrate.ts task.md
+pnpm exec tsx src/orchestrate.ts "Design the SQLite persistence layer for Parrot."
 ```
 
 Or through the package script:
 
 ```bash
-pnpm orchestrate task.md
+pnpm orchestrate task.md "Also account for migration from the current TOON state files."
 ```
 
 The orchestrator will:
@@ -128,28 +154,40 @@ The orchestrator will:
 3. Create a new run directory under `runs/`.
 4. Write the planner prompt.
 5. Send a one-line instruction to the planner pane.
-6. Wait for the planner `result.json`.
+6. Wait for the planner `result.toon`.
 7. Write the reviewer prompt.
 8. Send a one-line instruction to the reviewer pane.
-9. Wait for the reviewer `result.json`.
+9. Wait for the reviewer `result.toon`.
 10. Update the objection registry.
-11. Print a round summary.
-12. Ask the human what to do next.
+11. Print a round summary and artifact paths.
+12. Continue automatically if open objections remain and the iteration cap
+    has not been reached.
+13. Ask the human what to do next only after consensus or the iteration
+    cap.
 
 ## Human Gate
 
-After every round, Parrot stops for a terminal decision.
+Parrot does not ask for human intervention while the reviewer and planner
+still have open objections to work through and iteration budget remains.
+It asks only when consensus is reached or when the configured iteration
+cap is reached.
 
-If open blocking objections remain:
+If open objections remain before the cap, Parrot continues automatically:
 
 ```text
-Open blockers remain. [c]ontinue / [a]pprove anyway / [q]uit:
+Open objections remain (2: 0 blocking, 2 major, 0 minor). Continuing automatically.
 ```
 
-If no blocking objections remain:
+If the iteration cap is reached with open objections:
 
 ```text
-Consensus reached. [a]pprove / [c]ontinue another round / [q]uit:
+Iteration cap reached with open objections. [c]ontinue one more round / [m]essage planner and continue / [a]pprove anyway / [q]uit:
+```
+
+If no open objections remain:
+
+```text
+Consensus reached. [a]pprove / [c]ontinue another round / [m]essage planner / [q]uit:
 ```
 
 If an agent times out:
@@ -158,7 +196,14 @@ If an agent times out:
 Agent timed out. [r]etry / [q]uit:
 ```
 
-Consensus never auto-exits. Human approval is still required.
+Consensus never auto-exits. Human approval is still required. Approval
+with open objections is only offered after the iteration cap is reached,
+and the prompt labels that path as approval anyway instead of consensus.
+
+At either intervention point, choosing `m` lets the human enter
+additional instructions for the planner, such as extra context, files to
+inspect, or constraints to consider. Parrot records that message and
+includes it in the next planner turn under `Additional Human Messages`.
 
 ## Runtime Artifacts
 
@@ -174,31 +219,58 @@ Each iteration writes:
 runs/<runId>/iter-<n>/planner/
   prompt.md
   plan.md
-  result.json
+  result.toon
   repair-prompt.md    # only if repair was needed
 
 runs/<runId>/iter-<n>/reviewer/
   prompt.md
-  result.json
+  result.toon
   repair-prompt.md    # only if repair was needed
 
-runs/<runId>/state.json
+runs/<runId>/state.toon
 ```
 
 `runs/` is gitignored.
 
+When a human approves a plan, Parrot also copies it to:
+
+```text
+approved-plans/<task-slug>-<runId>/
+  plan-<summary-slug>.md
+  approval.toon
+```
+
+`approval.toon` records the run id, approved iteration, approval time,
+internal source plan path, and open objection counts at approval time.
+
+The planner's working plan remains in the run folder for the approved
+iteration. The approved plan is a separate copy intended for review and
+handoff:
+
+```text
+runs/<runId>/iter-<n>/planner/plan.md                    # planner's turn output
+approved-plans/<task-slug>-<runId>/plan-<summary-slug>.md # final approved copy
+```
+
+After every reviewer turn, Parrot prints the current planner plan,
+planner result, reviewer result, and run state paths before asking for a
+human decision. After approval, it prints the final plan path, approval
+metadata path, source planner plan path, and run artifact directory.
+
+Parrot uses TOON for local workflow artifacts wherever possible. JSON is
+kept only for external contracts that require it, such as Herdr CLI
+responses.
+
 ## Result Contract
 
-Every result must include this envelope:
+Every LLM result is written as TOON and must include this envelope:
 
-```json
-{
-  "runId": "20260717-1432-x7k2",
-  "iteration": 1,
-  "role": "planner",
-  "turnId": "abc123",
-  "payload": {}
-}
+```toon
+runId: 20260717-1432-x7k2
+iteration: 1
+role: planner
+turnId: abc123
+payload:
 ```
 
 The envelope is checked before the payload. A result is rejected if:
@@ -208,10 +280,10 @@ The envelope is checked before the payload. A result is rejected if:
 - `role` is not the expected role.
 - `turnId` does not match the active turn.
 - The file is older than the send time.
-- The JSON does not match the role schema.
+- The TOON document does not match the role schema.
 
 Agents are instructed to write `result.tmp` first, then rename it to
-`result.json`.
+`result.toon`.
 
 ## Planner Payload
 
@@ -257,7 +329,7 @@ orchestrator maintains the registry and derives current status.
 
 ## Objection Registry
 
-`state.json` stores:
+`state.toon` stores:
 
 - immutable objection records
 - status transition records
@@ -304,7 +376,7 @@ pnpm exec tsx src/orchestrate.ts
 Expected output:
 
 ```text
-Usage: pnpm exec tsx src/orchestrate.ts <task.md>
+Usage: pnpm exec tsx src/orchestrate.ts <prompt text | task.md> [more prompt text]
 ```
 
 Preflight check:
@@ -341,14 +413,14 @@ Do the same for `reviewer`.
 Parrot sends text with:
 
 ```text
-herdr agent send <pane> <text>
-herdr pane send-keys <pane> enter
+herdr pane run <pane> <text>
 ```
 
 This is required because `herdr agent send` writes literal text without
-submitting it to the TUI.
+submitting it to the TUI. `pane run` sends the instruction and submits it
+with Enter.
 
-### Invalid `result.json`
+### Invalid `result.toon`
 
 Parrot sends one repair prompt with a new `turnId`. If the second result
 is invalid, the turn fails and the CLI exits or asks for retry depending
@@ -357,7 +429,7 @@ on where the failure occurred.
 ### Stale Result Rejected
 
 This is expected. Before each turn, Parrot removes any existing
-`result.json` and records the send time. A result must be newer than that
+`result.toon` and records the send time. A result must be newer than that
 send time and must carry the active `turnId`.
 
 ## Source Layout
@@ -371,6 +443,9 @@ src/
   registry.ts      append-only objection registry and state writes
   schemas.ts       Zod schemas and TypeScript types
   waitResult.ts    result watching, freshness, and identity checks
+
+packages/contracts/
+  src/toon/         canonical TOON encoder/decoder shared by the platform
 ```
 
 ## Current Development Notes

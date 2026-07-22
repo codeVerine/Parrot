@@ -8,6 +8,7 @@ type HerdrAgent = {
   agent?: string | null;
   agent_status?: string;
   cwd?: string | null;
+  name?: string | null;
   pane_id: string;
   terminal_id?: string;
   workspace_id: string;
@@ -27,13 +28,14 @@ export async function resolveTarget(role: "planner" | "reviewer"): Promise<Resol
   const { stdout } = await runHerdr(["agent", "list"]);
   const parsed = JSON.parse(stdout) as AgentListResponse;
   const agents = parsed.result.agents ?? [];
-  const matches = agents.filter((agent) => agent.agent === role);
+  const matches = agents.filter((agent) => agent.name === role);
 
   if (matches.length !== 1) {
     const candidates = agents
       .map((agent) => {
-        const label = agent.agent ?? "(no agent label)";
-        return `- ${label} pane=${agent.pane_id} terminal=${agent.terminal_id ?? "unknown"} cwd=${agent.cwd ?? "unknown"}`;
+        const name = agent.name ?? "(no pane name)";
+        const agentLabel = agent.agent ?? "(no agent label)";
+        return `- name=${name} agent=${agentLabel} pane=${agent.pane_id} terminal=${agent.terminal_id ?? "unknown"} cwd=${agent.cwd ?? "unknown"}`;
       })
       .join("\n");
 
@@ -55,8 +57,7 @@ export async function resolveTarget(role: "planner" | "reviewer"): Promise<Resol
 }
 
 export async function sendInstruction(paneId: string, text: string): Promise<void> {
-  await runHerdr(["agent", "send", paneId, text]);
-  await runHerdr(["pane", "send-keys", paneId, "enter"]);
+  await runHerdr(["pane", "run", paneId, text]);
 }
 
 export async function notify(title: string, body?: string): Promise<void> {

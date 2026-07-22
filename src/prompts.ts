@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { encodeToon } from "@platform/contracts";
 import type { ObjectionView } from "./registry.js";
 import type { TurnIdentity } from "./schemas.js";
 
@@ -9,6 +10,7 @@ export function plannerPrompt(args: {
   planPath: string;
   resultPath: string;
   openObjections: ObjectionView[];
+  humanMessages: Array<{ afterIteration: number; message: string }>;
 }): string {
   return [
     "# Planner Turn",
@@ -30,14 +32,21 @@ export function plannerPrompt(args: {
           )
           .join("\n"),
     "",
+    "## Additional Human Messages",
+    args.humanMessages.length === 0
+      ? "None."
+      : args.humanMessages
+          .map((item) => `- After iteration ${item.afterIteration}: ${item.message}`)
+          .join("\n"),
+    "",
     "## Output Instructions",
     `1. Write the full plan to: ${resolve(args.planPath)}`,
-    "2. Address every open objection ID explicitly in the JSON result.",
-    `3. Write JSON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
-    "4. Do not write markdown into result.json. It must match this shape:",
+    "2. Address every open objection ID explicitly in the TOON result.",
+    `3. Write TOON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
+    "4. Do not write markdown or JSON into result.toon. It must match this shape:",
     "",
-    "```json",
-    JSON.stringify(
+    "```toon",
+    encodeToon(
       {
         runId: args.identity.runId,
         iteration: args.identity.iteration,
@@ -53,8 +62,6 @@ export function plannerPrompt(args: {
           })),
         },
       },
-      null,
-      2,
     ),
     "```",
     "",
@@ -92,11 +99,11 @@ export function reviewerPrompt(args: {
     "## Output Instructions",
     "1. Mark each prior objection as open or resolved. Do not rename or delete prior objections.",
     "2. Add new objections only when they have concrete evidence or a clear missing-evidence rationale.",
-    `3. Write JSON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
-    "4. Do not write markdown into result.json. It must match this shape:",
+    `3. Write TOON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
+    "4. Do not write markdown or JSON into result.toon. It must match this shape:",
     "",
-    "```json",
-    JSON.stringify(
+    "```toon",
+    encodeToon(
       {
         runId: args.identity.runId,
         iteration: args.identity.iteration,
@@ -111,8 +118,6 @@ export function reviewerPrompt(args: {
           newObjections: [],
         },
       },
-      null,
-      2,
     ),
     "```",
     "",
@@ -127,16 +132,16 @@ export function repairPrompt(args: {
   validationError: string;
 }): string {
   return [
-    "Your previous result.json was invalid.",
+    "Your previous result.toon was invalid.",
     "",
-    "Fix only the JSON result. Do not revise the substantive work unless needed to satisfy the schema.",
+    "Fix only the TOON result. Do not revise the substantive work unless needed to satisfy the schema.",
     "",
     "Validation error:",
     args.validationError,
     "",
     "The corrected result must use this envelope:",
-    "```json",
-    JSON.stringify(
+    "```toon",
+    encodeToon(
       {
         runId: args.identity.runId,
         iteration: args.identity.iteration,
@@ -144,15 +149,13 @@ export function repairPrompt(args: {
         turnId: args.identity.turnId,
         payload: {},
       },
-      null,
-      2,
     ),
     "```",
-    `Write JSON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
+    `Write TOON first to ${resolve(resultTmpPath(args.resultPath))}, then rename it to ${resolve(args.resultPath)}.`,
     `Prompt path: ${resolve(args.promptPath)}`,
   ].join("\n");
 }
 
 function resultTmpPath(resultPath: string): string {
-  return resultPath.replace(/\.json$/, ".tmp");
+  return resultPath.replace(/\.toon$/, ".tmp");
 }

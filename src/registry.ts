@@ -1,4 +1,5 @@
 import { writeFile, rename } from "node:fs/promises";
+import { encodeToon } from "@platform/contracts";
 import type { NewObjection, ObjectionStatus, PriorObjectionStatus, Severity } from "./schemas.js";
 
 export type ResolvedPane = {
@@ -51,7 +52,7 @@ export function createInitialState(runId: string, panes: State["panes"]): State 
 
 export async function writeStateAtomic(path: string, state: State): Promise<void> {
   const tmpPath = `${path}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await writeFile(tmpPath, encodeToon(state), "utf8");
   await rename(tmpPath, path);
 }
 
