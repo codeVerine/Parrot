@@ -1,0 +1,28 @@
+{
+  "name": "@platform/persistence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0 <23.0.0 || >=23.4.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "../../node_modules/.bin/tsc -p ../contracts/tsconfig.json && node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@platform/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
