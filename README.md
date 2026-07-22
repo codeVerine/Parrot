@@ -35,6 +35,14 @@ only the file-backed MVP from the local plan.
 - Reusable `@platform/workflow-engine` package with deterministic turn and
   planning reducers, pure guards, usage/budget fold, orphan handling, and
   persistence-backed recovery.
+- Reusable `@platform/llm-boundary` package with prompt builder, TOON
+  extraction/validation, bounded repair verdicts, injection-safe evidence
+  quoting, and non-destructive objection merge post-processing.
+- Reusable `@platform/human-loop` package with frontier finding conversion,
+  panel contradiction detection, dashboard read-model projections,
+  human notification sinks, versioned session-log cost adapters, and
+  transcript redaction.
+- `@platform/dashboard` React + Vite UI over the human-loop decision API.
 
 ## What Is Not Implemented Yet
 

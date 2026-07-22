@@ -318,6 +318,26 @@ export class PersistenceStore {
     return this.db.prepare(`SELECT * FROM ${table}`).all();
   }
 
+  listObjections(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare("SELECT * FROM objections WHERE workflow_id = ? ORDER BY updated_at ASC").all(workflowId) as Row[];
+  }
+
+  listDecisions(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare("SELECT * FROM decisions WHERE workflow_id = ? ORDER BY created_at ASC").all(workflowId) as Row[];
+  }
+
+  listArtifacts(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare("SELECT * FROM artifacts WHERE workflow_id = ? ORDER BY created_at ASC").all(workflowId) as Row[];
+  }
+
+  listTurns(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare("SELECT * FROM turns WHERE workflow_id = ? ORDER BY created_at ASC").all(workflowId) as Row[];
+  }
+
+  listUsage(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare("SELECT * FROM usage_ledger WHERE workflow_id = ? ORDER BY recorded_at ASC").all(workflowId) as Row[];
+  }
+
   private migrate(): void {
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);");
     const row = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get();
