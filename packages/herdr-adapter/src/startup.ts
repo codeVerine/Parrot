@@ -1,7 +1,7 @@
 import { RuntimeSignalSchema, signalId, type RuntimeSignal } from "@platform/contracts";
 import type { HerdrCli } from "./client/cli.js";
 import type { HerdrClient } from "./client/socket.js";
-import type { HerdrSchema, IntegrationStatus } from "./client/types.js";
+import { HERDR_EVENT_TYPES, type HerdrSchema, type IntegrationStatus } from "./client/types.js";
 import { withConfig, type AdapterConfig } from "./config.js";
 import { DegradedModeError, ProtocolMismatchError } from "./errors.js";
 
@@ -11,7 +11,7 @@ export async function runStartupChecks(client: HerdrClient, cli: HerdrCli, confi
   const config = withConfig(configInput);
   const schema = await cli.schema(config.operationTimeoutMs);
   const variants = extractEventVariants(schema);
-  if (schema.protocol !== config.protocol || schema.schema_version !== config.schemaVersion || variants.length !== 23) {
+  if (schema.protocol !== config.protocol || schema.schema_version !== config.schemaVersion || variants.length !== HERDR_EVENT_TYPES.length) {
     const error = new ProtocolMismatchError(config.protocol, schema.protocol ?? null, config.schemaVersion, schema.schema_version ?? null);
     emit?.(protocolMismatchSignal(error));
     throw error;

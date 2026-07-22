@@ -11,7 +11,7 @@ import { IdentityMap } from "./identity.js";
 import { Reconciler } from "./reconcile.js";
 import { normalizeStatus, type NormalizedStatus } from "./status.js";
 import { runStartupChecks, degradedSignal, type StartupResult } from "./startup.js";
-import { readSafeArtifact, ResultFileWatcher, type SafeArtifact } from "./watch.js";
+import { readSafeArtifact, ResultFileWatcher, ResultWatchStoppedError, ResultWatchTimeoutError, type SafeArtifact } from "./watch.js";
 
 export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string> };
 export type AgentHandle = { id: AgentId; paneId: string; workflowId: string; provider: string; role: string; sessionId: string | null; sessionPath: string | null };
@@ -32,7 +32,7 @@ export interface AgentRuntime {
   stop(id: AgentId): Promise<void>;
 }
 
-type TurnContext = { request: TurnRequest; watcher: ResultFileWatcher; sentAtMs: number; cancelled: boolean; repairUsed: boolean };
+type TurnContext = { agentId: AgentId; request: TurnRequest; watcher: ResultFileWatcher; sentAtMs: number; cancelled: boolean; repairUsed: boolean; resultSeen: boolean; resultRead: boolean };
 type RuntimeOptions = { client: HerdrClient; cli?: HerdrCli; config?: Partial<AdapterConfig>; identity?: IdentityMap; startup?: StartupResult; persistedDeadlines?: Array<{ turnId: string; deadline: string; attempt: "primary" | "repair" }>; onSignal?: (signal: RuntimeSignal) => void };
 
 export class HerdrAgentRuntime implements AgentRuntime {
@@ -41,6 +41,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private readonly deadlines: TurnDeadlineManager;
   private readonly reconciler: Reconciler;
   private readonly turns = new Map<string, TurnContext>();
+  private readonly orphanTurns = new Map<string, TurnContext>();
   private readonly signalQueues = new Map<string, RuntimeSignal[]>();
   private readonly signalWaiters = new Map<string, Array<(signal: RuntimeSignal) => void>>();
   private readonly statusHandlers: Array<(event: StatusEvent) => void> = [];
@@ -51,16 +52,14 @@ export class HerdrAgentRuntime implements AgentRuntime {
     this.config = withConfig(options.config);
     this.identity = options.identity ?? new IdentityMap();
     this.deadlines = new TurnDeadlineManager((signal) => this.emitSignal(signal), options.persistedDeadlines ?? []);
-    this.reconciler = new Reconciler(options.client, this.identity, (signal) => this.emitSignal(signal), this.config);
+    this.reconciler = new Reconciler(options.client, this.identity, (signal) => this.emitSignal(signal), this.config, () => this.findMissedResults());
     if (options.startup?.degraded) this.emitSignal(degradedSignal(options.startup));
     void this.subscribe();
   }
 
   static async create(options: RuntimeOptions & { cli: HerdrCli }): Promise<HerdrAgentRuntime> {
     const config = withConfig(options.config);
-    let startup: StartupResult;
-    try { startup = await runStartupChecks(options.client, options.cli, config, options.onSignal); }
-    catch (error) { if (error instanceof AdapterError) throw error; throw error; }
+    const startup = await runStartupChecks(options.client, options.cli, config, options.onSignal);
     return new HerdrAgentRuntime({ ...options, config, startup });
   }
 
@@ -82,18 +81,22 @@ export class HerdrAgentRuntime implements AgentRuntime {
     const identity = this.identity.get(id);
     const attempt = turn.attempt ?? "primary";
     if (!identity || !identity.paneId) throw this.deliveryFailure(new TurnDeliveryError("pane_dead", String(turn.turnId), attempt, "Agent pane is not available."));
+    if (attempt === "primary") this.pruneReadTurns(id);
+    const key = this.turnKey(id, turn.turnId);
+    const existing = this.turns.get(key);
     if (attempt === "repair") {
-      const existing = this.turns.get(this.turnKey(id, turn.turnId));
-      if (existing?.repairUsed) throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), "repair", "Only one repair attempt is permitted."));
+      if (!existing) throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), "repair", "Repair requires an active primary turn."));
+      if (existing.repairUsed) throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), "repair", "Only one repair attempt is permitted."));
       if (basename(turn.promptPath) !== "repair-prompt.md") throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), "repair", "Repair turns must reference repair-prompt.md."));
-    } else if (this.turns.has(this.turnKey(id, turn.turnId))) {
+    } else if (existing) {
       throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), attempt, "Turn is already active."));
     }
-    if (identity.status !== "idle") throw this.deliveryFailure(new TurnDeliveryError("agent_not_idle", String(turn.turnId), attempt, `Agent is ${identity.status}.`));
+    if (attempt === "primary" && this.hasActiveTurn(id)) throw this.deliveryFailure(new TurnDeliveryError("agent_not_idle", String(turn.turnId), attempt, "Agent already has an active turn."));
+    if (identity.status !== "idle" && !(attempt === "repair" && existing)) throw this.deliveryFailure(new TurnDeliveryError("agent_not_idle", String(turn.turnId), attempt, `Agent is ${identity.status}.`));
 
     const sentAtMs = Date.now();
     const watcher = new ResultFileWatcher(turn.resultPath, { turnDir: dirname(turn.resultPath), sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs }, (signal) => this.emitSignal({ ...signal, workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id) } as RuntimeSignal));
-    watcher.start();
+    if (turn.deadline.getTime() > Date.now()) watcher.start();
     const command = `Read ${turn.promptPath} and write the ${turn.attempt === "repair" ? "repair " : ""}result to ${turn.resultPath}; schema=${turn.schemaId}; nonce=${turn.nonce}; promptHash=${turn.promptHash}`;
     try {
       await this.options.client.sendAgent(identity.paneId, command, this.config.operationTimeoutMs);
@@ -101,19 +104,27 @@ export class HerdrAgentRuntime implements AgentRuntime {
       watcher.stop();
       throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), attempt, error instanceof Error ? error.message : String(error)));
     }
-    const key = this.turnKey(id, turn.turnId);
     const context = this.turns.get(key);
-    if (context) { context.request = turn; context.sentAtMs = sentAtMs; context.repairUsed = true; context.watcher.stop(); context.watcher = watcher; }
-    else this.turns.set(key, { request: turn, watcher, sentAtMs, cancelled: false, repairUsed: attempt === "repair" });
+    if (context) { context.request = turn; context.sentAtMs = sentAtMs; context.repairUsed = true; context.resultSeen = false; context.resultRead = false; context.watcher.stop(); context.watcher = watcher; }
+    else this.turns.set(key, { agentId: id, request: turn, watcher, sentAtMs, cancelled: false, repairUsed: attempt === "repair", resultSeen: false, resultRead: false });
+    this.identity.setStatus(id, "working");
     this.deadlines.arm(String(turn.turnId), turn.deadline, attempt);
-    void watcher.wait(Math.max(1, turn.deadline.getTime() - Date.now())).then((artifact) => {
+    const remainingMs = turn.deadline.getTime() - Date.now();
+    if (remainingMs <= 0) return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString() };
+    void watcher.wait(remainingMs).then((artifact) => {
+      const current = this.turns.get(key);
+      if (current) current.resultSeen = true;
       this.emitSignal(RuntimeSignalSchema.parse({
         signalId: signalId(), kind: "ResultFileSeen", classification: "observation", observedAt: new Date().toISOString(), source: "fs_watch",
         workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id), artifactPath: artifact.path, size: artifact.size, contentHash: artifact.hash,
       }));
     }).catch((error) => {
-      if (error instanceof ArtifactRejectedError) return;
-      if (error instanceof ResultWatchError) this.emitSignal(RuntimeSignalSchema.parse({ signalId: signalId(), kind: "ResultWatchFailed", classification: "fault", observedAt: new Date().toISOString(), source: "adapter_internal", workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id), artifactPath: turn.resultPath, rawError: error.message }));
+      if (error instanceof ArtifactRejectedError || error instanceof ResultWatchStoppedError || error instanceof ResultWatchTimeoutError) return;
+      if (error instanceof ResultWatchError) {
+        this.emitSignal(RuntimeSignalSchema.parse({ signalId: signalId(), kind: "ResultWatchFailed", classification: "fault", observedAt: new Date().toISOString(), source: "adapter_internal", workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id), artifactPath: turn.resultPath, rawError: error.message }));
+        const current = this.turns.get(key);
+        if (current) this.moveToOrphans(key, current, true);
+      }
     });
     return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString() };
   }
@@ -124,19 +135,23 @@ export class HerdrAgentRuntime implements AgentRuntime {
     return new Promise<RuntimeSignal>((resolve, reject) => {
       const key = String(turnId);
       const queue = this.signalQueues.get(key);
-      if (queue?.length) { resolve(queue.shift()!); return; }
+      if (queue?.length) { const signal = queue.shift()!; if (!queue.length) this.signalQueues.delete(key); resolve(signal); return; }
       const waiter = (signal: RuntimeSignal) => { clearTimeout(timer); resolve(signal); };
-      const timer = setTimeout(() => { const waiters = this.signalWaiters.get(key) ?? []; const index = waiters.indexOf(waiter); if (index >= 0) waiters.splice(index, 1); reject(new Error(`Timed out waiting for signal for ${String(turnId)}.`)); }, timeout);
+      const timer = setTimeout(() => { const waiters = this.signalWaiters.get(key) ?? []; const index = waiters.indexOf(waiter); if (index >= 0) waiters.splice(index, 1); if (!waiters.length) this.signalWaiters.delete(key); reject(new Error(`Timed out waiting for signal for ${String(turnId)}.`)); }, timeout);
       const waiters = this.signalWaiters.get(key) ?? []; waiters.push(waiter); this.signalWaiters.set(key, waiters);
     });
   }
 
   /** Returns raw bytes and a pre-parse hash; envelope and schema validation belongs to Extraction. */
   async result(id: AgentId, turnId: TurnId): Promise<TurnResult> {
-    const context = this.turns.get(this.turnKey(id, turnId));
+    const key = this.turnKey(id, turnId);
+    const context = this.turns.get(key) ?? this.orphanTurns.get(key);
     if (!context) throw this.watchFailure(new ResultWatchError(String(turnId), "No active turn artifact path is known."));
     try {
       const artifact = await readSafeArtifact(context.request.resultPath, { turnDir: dirname(context.request.resultPath), sentAtMs: context.sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs });
+      context.resultRead = true;
+      this.signalQueues.delete(String(turnId));
+      if (context.cancelled) this.orphanTurns.delete(key);
       return { ...artifact, turnId };
     } catch (error) {
       if (error instanceof ArtifactRejectedError) throw this.artifactFailure(error, context.request);
@@ -155,13 +170,30 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async stop(id: AgentId): Promise<void> { await this.control(id, "stop"); }
 
   getSignals(): readonly RuntimeSignal[] { return this.receivedSignals; }
-  async close(): Promise<void> { this.unsubscribe?.(); this.unsubscribe = null; this.deadlines.dispose(); for (const context of this.turns.values()) context.watcher.stop(); }
+  async close(): Promise<void> {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.deadlines.dispose();
+    for (const context of this.turns.values()) context.watcher.stop();
+    for (const context of this.orphanTurns.values()) context.watcher.stop();
+    this.turns.clear();
+    this.orphanTurns.clear();
+    this.signalQueues.clear();
+    this.signalWaiters.clear();
+  }
 
   private async control(id: AgentId, action: "interrupt" | "stop") {
-    const identity = this.identity.get(id); if (!identity?.paneId) return;
-    try { if (action === "interrupt") await this.options.client.interruptAgent(identity.paneId, this.config.operationTimeoutMs); else await this.options.client.stopAgent(identity.paneId, this.config.operationTimeoutMs); }
-    catch (error) { throw this.deliveryFailure(new TurnDeliveryError("transport_error", "control", "primary", error instanceof Error ? error.message : String(error))); }
-    for (const [key, context] of this.turns) if (key.startsWith(`${String(id)}:`)) { context.cancelled = true; this.deadlines.cancel(context.request.turnId as string); }
+    const identity = this.identity.get(id);
+    if (identity?.paneId) {
+      try { if (action === "interrupt") await this.options.client.interruptAgent(identity.paneId, this.config.operationTimeoutMs); else await this.options.client.stopAgent(identity.paneId, this.config.operationTimeoutMs); }
+      catch (error) { throw this.deliveryFailure(new TurnDeliveryError("transport_error", "control", "primary", error instanceof Error ? error.message : String(error))); }
+    }
+    for (const [key, context] of [...this.turns]) {
+      if (context.agentId !== id) continue;
+      context.cancelled = true;
+      this.moveToOrphans(key, context);
+    }
+    this.identity.setStatus(id, "idle");
   }
 
   private async subscribe() {
@@ -187,9 +219,23 @@ export class HerdrAgentRuntime implements AgentRuntime {
 
   private emitSignal(signal: RuntimeSignal) {
     const parsed = RuntimeSignalSchema.parse(signal); this.receivedSignals.push(parsed);
+    if (this.receivedSignals.length > this.config.signalHistoryLimit) this.receivedSignals.splice(0, this.receivedSignals.length - this.config.signalHistoryLimit);
     const turnId = parsed.turnId; if (!turnId) return;
-    const waiter = this.signalWaiters.get(turnId)?.shift(); if (waiter) { waiter(parsed); return; }
-    const queue = this.signalQueues.get(turnId) ?? []; queue.push(parsed); this.signalQueues.set(turnId, queue);
+    const waiters = this.signalWaiters.get(turnId);
+    const waiter = waiters?.shift();
+    if (waiters?.length === 0) this.signalWaiters.delete(turnId);
+    if (waiter) waiter(parsed);
+    else if (this.findTurnContext(turnId)) {
+      const queue = this.signalQueues.get(turnId) ?? [];
+      queue.push(parsed);
+      if (queue.length > this.config.signalQueueLimit) queue.splice(0, queue.length - this.config.signalQueueLimit);
+      this.signalQueues.set(turnId, queue);
+    }
+    if (parsed.kind === "DeadlineExpired") {
+      const key = this.findTurnKey(turnId);
+      const context = key ? this.turns.get(key) : undefined;
+      if (key && context) this.moveToOrphans(key, context, true);
+    }
   }
 
   private emitError(error: AdapterError): never | void {
@@ -206,5 +252,48 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private deliveryFailure(error: TurnDeliveryError): TurnDeliveryError { this.emitError(error); return error; }
   private watchFailure(error: ResultWatchError): ResultWatchError { this.emitError(error); return error; }
   private artifactFailure(error: ArtifactRejectedError, turn: TurnRequest): ArtifactRejectedError { this.emitSignal({ signalId: signalId(), kind: "ArtifactRejected", classification: "fault", observedAt: new Date().toISOString(), source: "adapter_internal", workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: null, reason: error.reason, artifactPath: error.artifactPath, observed: error.observed, limit: error.limit }); return error; }
+  private hasActiveTurn(id: AgentId): boolean { return [...this.turns.values()].some((context) => context.agentId === id && !context.resultRead); }
+  private pruneReadTurns(id: AgentId): void {
+    for (const [key, context] of [...this.turns]) if (context.agentId === id && context.resultRead) this.cleanupTurn(key, context);
+  }
+  private findTurnContext(turnId: string): TurnContext | undefined { return [...this.turns.values(), ...this.orphanTurns.values()].find((context) => String(context.request.turnId) === turnId); }
+  private findTurnKey(turnId: string): string | undefined {
+    for (const [key, context] of this.turns) if (String(context.request.turnId) === turnId) return key;
+    for (const [key, context] of this.orphanTurns) if (String(context.request.turnId) === turnId) return key;
+    return undefined;
+  }
+  private cleanupTurn(key: string, context: TurnContext, keepQueue = false): void {
+    context.watcher.stop();
+    this.deadlines.cancel(String(context.request.turnId));
+    this.turns.delete(key);
+    if (!keepQueue) this.signalQueues.delete(String(context.request.turnId));
+    this.identity.setStatus(context.agentId, "idle");
+  }
+  private moveToOrphans(key: string, context: TurnContext, keepQueue = false): void {
+    this.cleanupTurn(key, context, keepQueue);
+    this.orphanTurns.set(key, context);
+    while (this.orphanTurns.size > this.config.orphanTurnLimit) {
+      const oldest = this.orphanTurns.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.orphanTurns.delete(oldest);
+    }
+  }
+  private async findMissedResults(): Promise<string[]> {
+    const missed: string[] = [];
+    for (const [key, context] of [...this.turns, ...this.orphanTurns]) {
+      try {
+        const artifact = await readSafeArtifact(context.request.resultPath, { turnDir: dirname(context.request.resultPath), sentAtMs: context.sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs });
+        missed.push(artifact.path);
+        if (!context.resultSeen) {
+          context.resultSeen = true;
+          this.emitSignal(RuntimeSignalSchema.parse({ signalId: signalId(), kind: "ResultFileSeen", classification: "observation", observedAt: new Date().toISOString(), source: "reconcile", workflowId: context.request.workflowId, iterationId: context.request.iterationId, turnId: String(context.request.turnId), agentId: String(context.agentId), artifactPath: artifact.path, size: artifact.size, contentHash: artifact.hash }));
+        }
+        if (context.cancelled) this.orphanTurns.delete(key);
+      } catch (error) {
+        if (error instanceof ArtifactRejectedError || (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      }
+    }
+    return missed;
+  }
   private turnKey(id: AgentId, turnId: TurnId) { return `${String(id)}:${String(turnId)}`; }
 }

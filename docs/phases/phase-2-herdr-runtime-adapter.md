@@ -29,7 +29,7 @@ Startup runs `herdr api schema --json`, pins protocol 16, schema version 1, and 
 
 ## 5.4 Identity mapping
 
-The in-memory map owns `AgentId <-> pane_id`, `workflowId <-> workspace_id`, and optional provider session identity. `pane_id` is never the platform agent identity. Pane exit, detection, and respawn update the mapping. Persistence of this shape belongs to Phase 3.
+The in-memory map owns `AgentId <-> pane_id`, `workflowId <-> workspace_id`, and optional provider session identity. `pane_id` is never the platform agent identity. Pane exit, detection, and respawn update the mapping. During reconciliation, a matching provider session remaps to the existing agent ID; a genuinely new pane receives a generated platform ID and is never keyed from its pane ID. Persistence of this shape belongs to Phase 3.
 
 ## 5.5 Status normalization
 
@@ -45,15 +45,15 @@ Status is a heuristic. `done` can accelerate an artifact check but never complet
 
 ## 5.6 Result watching and safety
 
-The adapter watches the turn directory for `result.toon`, ignores `result.tmp` and partials, hashes bytes before parsing, and falls back to polling after watcher failure. It rejects symlinks, unexpected ownership, world-writable directories, stale mtimes, canonical path escapes, and oversized files. These checks precede TOON parsing. Extraction owns envelope and schema validation.
+The adapter watches the turn directory for `result.toon`, ignores `result.tmp` and partials, hashes bytes before parsing, and falls back to polling after watcher failure. It rejects symlinks, unexpected ownership, world-writable directories, stale mtimes, canonical path escapes, and oversized files. Safety reads use one `O_NOFOLLOW` file descriptor and `fstat`/read from that descriptor, so the path cannot be swapped between the check and read. Same-second filesystem timestamps are accepted at the send-time boundary. Deliberate watcher shutdown is a distinct outcome and is never reported as `ResultWatchFailed`. These checks precede TOON parsing. Extraction owns envelope and schema validation.
 
 ## 5.7 Deadlines and repair
 
-The primary timer starts after delivery acknowledgment. Expiry emits observation signal `DeadlineExpired` with `primary` or `repair`; the workflow engine may derive `AgentTimedOut`. Working-to-idle without an artifact can trigger an early check and grace timer. Deadline records can reconstruct timers after restart.
+The primary timer starts after delivery acknowledgment. Expiry emits observation signal `DeadlineExpired` with `primary` or `repair`; the workflow engine may derive `AgentTimedOut`. Past-due sends do not start a result wait that could be mistaken for a watch fault. Working-to-idle without an artifact can trigger an early check and grace timer. Deadline records can reconstruct timers after restart. Cancellation, timeout, genuine watch failure, and shutdown stop active watchers; late artifacts remain bounded orphan candidates and are rediscovered by reconciliation.
 
 ## 5.8 Reconciliation
 
-Reconnect runs `session.snapshot` and `agent.list`, diffs the identity map, and emits `SnapshotReconciled`. Bounded retry failure emits `ReconnectFailed`. Herdr subscriptions have no replay cursor, so finished agents, dead panes, status changes, and worktree changes are recoverable through reconciliation.
+Reconnect runs `session.snapshot` and `agent.list`, diffs and updates the identity map, binds newly discovered agents without deriving identity from `pane_id`, scans known turn artifacts, and emits `SnapshotReconciled`. Bounded retry failure emits `ReconnectFailed`. Herdr subscriptions have no replay cursor, so finished agents, dead panes, status changes, and missed result files are recoverable through reconciliation. Worktree state is not reconstructed here because the Phase 1 signal contract does not carry a worktree delta; the adapter consumes worktree events so a later state projection can own that addition.
 
 ## 5.9 Event subscription
 
@@ -61,7 +61,7 @@ The pinned schema contains exactly these 23 variants: `workspace_created`, `work
 
 ## 5.10 Configuration
 
-The adapter configures protocol and schema pins, required integrations, production/development mode, turn deadline, grace timer, artifact size limit, watch debounce, polling interval, operation timeout, and reconnect backoff. Defaults are conservative and explicit; no Herdr wait relies on an undocumented default.
+The adapter configures protocol and schema pins, required integrations, production/development mode, turn deadline, grace timer, artifact size limit, watch debounce, polling interval, operation timeout, reconnect backoff, signal history/queue limits, and orphan-turn retention. Defaults are conservative and explicit; no Herdr wait relies on an undocumented default.
 
 ## 5.11 Failure-path mapping
 
@@ -80,7 +80,7 @@ Every adapter error class is represented in `signalmap.ts`; the adapter does not
 
 ## 5.12 Tests
 
-Tests use an in-process protocol-16 fake. They cover startup pinning, missing integrations, pane remapping, raw status normalization, all six artifact rejection reasons, repair bounding, deadline expiry and restart re-derivation, reconnect reconciliation, error mapping, and result hash/signal correlation. The real-binary schema test is enabled only with `HERDR_PIN_TEST=1`.
+Tests use an in-process protocol-16 fake. They cover startup pinning, missing integrations, pane remapping and new-agent reconciliation, raw status normalization, all six artifact rejection reasons, same-second freshness, TOCTOU-resistant reads, repair and shutdown watcher bounding, optimistic busy rejection, deadline expiry and restart re-derivation, cancellation/orphan recovery, bounded signal history, reconnect reconciliation, error mapping, and result hash/signal correlation. The real-binary schema test is enabled only with `HERDR_PIN_TEST=1`.
 
 ## 5.13 Open question
 

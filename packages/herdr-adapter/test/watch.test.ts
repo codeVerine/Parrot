@@ -25,6 +25,14 @@ test("artifact safety records a hash before parsing", async () => {
   assert.equal(artifact.hash.length, 64); assert.equal(artifact.bytes.toString(), "value: ok\n");
 });
 
+test("artifact freshness tolerates a same-second filesystem timestamp", async () => {
+  const { dir, path } = await fixture();
+  const mtime = Math.floor(Date.now() / 1_000) * 1_000;
+  await utimes(path, new Date(mtime), new Date(mtime));
+  const artifact = await readSafeArtifact(path, { turnDir: dir, sentAtMs: mtime + 500, maxBytes: 100, pollIntervalMs: 2, debounceMs: 1 });
+  assert.equal(artifact.bytes.toString(), "value: ok\n");
+});
+
 test("artifact safety rejects unexpected ownership and world-writable directories", async () => {
   const { dir, path } = await fixture();
   await assert.rejects(() => readSafeArtifact(path, { turnDir: dir, expectedUid: (process.getuid?.() ?? 0) + 1, sentAtMs: 0, maxBytes: 100, pollIntervalMs: 2, debounceMs: 1 }), (error: unknown) => error instanceof ArtifactRejectedError && error.reason === "ownership");

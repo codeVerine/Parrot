@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { access, lstat, readFile, stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { ArtifactRejectedError, ResultWatchError } from "./errors.js";
 import type { RuntimeSignal } from "@platform/contracts";
@@ -9,23 +9,43 @@ export type ArtifactSafetyConfig = { turnDir: string; sentAtMs: number; maxBytes
 export type SafeArtifact = { path: string; bytes: Buffer; hash: string; size: number };
 export type WatchEmit = (signal: RuntimeSignal) => void;
 
+export class ResultWatchStoppedError extends Error {
+  constructor() { super("Result watcher stopped deliberately."); this.name = "ResultWatchStoppedError"; }
+}
+
+export class ResultWatchTimeoutError extends Error {
+  constructor() { super("Result watcher reached its deadline."); this.name = "ResultWatchTimeoutError"; }
+}
+
 /** The adapter stops at file safety. It does not parse TOON or validate the result envelope. */
 export async function readSafeArtifact(path: string, config: ArtifactSafetyConfig): Promise<SafeArtifact> {
   const canonicalPath = resolve(path);
   const canonicalDir = resolve(config.turnDir);
   const relation = relative(canonicalDir, canonicalPath);
   if (relation.startsWith("..") || isAbsolute(relation)) throw new ArtifactRejectedError("path_escape", path, canonicalPath, canonicalDir);
-  const file = await lstat(canonicalPath);
-  if (file.isSymbolicLink()) throw new ArtifactRejectedError("symlink", path);
-  const ownerUid = config.expectedUid ?? process.getuid?.();
-  if (ownerUid !== undefined && file.uid !== ownerUid) throw new ArtifactRejectedError("ownership", path, String(file.uid), String(ownerUid));
   const directory = await stat(canonicalDir);
   if ((directory.mode & 0o002) !== 0) throw new ArtifactRejectedError("world_writable", canonicalDir, (directory.mode & 0o777).toString(8), "no world write bit");
-  if (file.mtimeMs <= config.sentAtMs) throw new ArtifactRejectedError("stale_mtime", path, String(file.mtimeMs), String(config.sentAtMs));
-  if (file.size > config.maxBytes) throw new ArtifactRejectedError("oversize", path, String(file.size), String(config.maxBytes));
-  await access(canonicalPath, constants.R_OK);
-  const bytes = await readFile(canonicalPath);
-  return { path: canonicalPath, bytes, hash: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
+  let handle;
+  try {
+    handle = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new ArtifactRejectedError("symlink", path);
+    throw error;
+  }
+  try {
+    const file = await handle.stat();
+    if (file.isSymbolicLink()) throw new ArtifactRejectedError("symlink", path);
+    const ownerUid = config.expectedUid ?? process.getuid?.();
+    if (ownerUid !== undefined && file.uid !== ownerUid) throw new ArtifactRejectedError("ownership", path, String(file.uid), String(ownerUid));
+    const staleCutoff = Math.floor(config.sentAtMs / 1_000) * 1_000;
+    if (file.mtimeMs < staleCutoff) throw new ArtifactRejectedError("stale_mtime", path, String(file.mtimeMs), String(staleCutoff));
+    if (file.size > config.maxBytes) throw new ArtifactRejectedError("oversize", path, String(file.size), String(config.maxBytes));
+    const bytes = await handle.readFile();
+    if (bytes.length > config.maxBytes) throw new ArtifactRejectedError("oversize", path, String(bytes.length), String(config.maxBytes));
+    return { path: canonicalPath, bytes, hash: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
+  } finally {
+    await handle.close();
+  }
 }
 
 export class ResultFileWatcher {
@@ -51,15 +71,17 @@ export class ResultFileWatcher {
       try { return await readSafeArtifact(this.resultPath, this.config); }
       catch (error) {
         if (error instanceof ArtifactRejectedError) { this.emitArtifactRejected(error); throw error; }
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") { const failure = new ResultWatchError(this.resultPath, error instanceof Error ? error.message : String(error)); this.emitWatchFailure(failure); throw failure; }
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new ResultWatchError(this.resultPath, error instanceof Error ? error.message : String(error));
       }
       const remaining = Math.min(this.config.pollIntervalMs, deadline - Date.now());
       await this.waitForWakeup(Math.max(1, remaining));
+      if (this.stopped) throw new ResultWatchStoppedError();
     }
-    throw new ResultWatchError(this.resultPath, "Timed out waiting for result artifact.");
+    if (this.stopped) throw new ResultWatchStoppedError();
+    throw new ResultWatchTimeoutError();
   }
 
-  stop() { this.stopped = true; this.watcher?.close(); if (this.pollTimer) clearInterval(this.pollTimer); for (const wake of this.wakeups.splice(0)) wake(); }
+  stop() { this.stopped = true; this.watcher?.close(); this.watcher = null; if (this.pollTimer) clearInterval(this.pollTimer); this.pollTimer = null; for (const wake of this.wakeups.splice(0)) wake(); }
 
   private wake() { for (const wake of this.wakeups.splice(0)) wake(); }
   private startPolling() { if (this.pollTimer || this.stopped) return; this.pollTimer = setInterval(() => this.wake(), this.config.pollIntervalMs); }

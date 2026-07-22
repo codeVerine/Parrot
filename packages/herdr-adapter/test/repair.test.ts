@@ -17,4 +17,5 @@ test("repair reuses the turn and is bounded to one attempt", async () => {
   assert.match(fake.sentCommands[1], /repair-prompt/);
   await assert.rejects(() => runtime.send(handle.id, { ...base, promptPath: join(dir, "repair-prompt-2.md"), attempt: "repair" }), /Only one repair attempt/);
   await runtime.close();
+  assert.equal(runtime.getSignals().filter((signal) => signal.kind === "ResultWatchFailed").length, 0);
 });

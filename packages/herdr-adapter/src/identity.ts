@@ -29,6 +29,14 @@ export class IdentityMap {
   }
 
   get(agentId: AgentId) { return this.byAgentId.get(agentId); }
+  bySession(sessionId: string) { return this.values().find((identity) => identity.sessionId === sessionId); }
+  setStatus(agentId: AgentId, status: NormalizedStatus) {
+    const current = this.byAgentId.get(agentId);
+    if (!current) return null;
+    const next = { ...current, status };
+    this.byAgentId.set(agentId, next);
+    return next;
+  }
   byPane(paneId: string) { const id = this.agentByPane.get(paneId); return id ? this.byAgentId.get(id) : undefined; }
   values() { return [...this.byAgentId.values()]; }
   ids() { return [...this.byAgentId.keys()]; }

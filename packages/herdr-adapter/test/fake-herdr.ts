@@ -1,6 +1,6 @@
 import type { HerdrCli } from "../src/client/cli.js";
 import type { HerdrClient } from "../src/client/socket.js";
-import type { AgentStartSpec, HerdrAgent, HerdrEvent, HerdrSchema, HerdrSnapshot, IntegrationStatus } from "../src/client/types.js";
+import { HERDR_EVENT_TYPES, type AgentStartSpec, type HerdrAgent, type HerdrEvent, type HerdrSchema, type HerdrSnapshot, type IntegrationStatus } from "../src/client/types.js";
 
 export class FakeHerdr implements HerdrClient, HerdrCli {
   readonly sentCommands: string[] = [];
@@ -12,7 +12,7 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   private paneCounter = 0;
 
   async schema(_timeoutMs: number): Promise<HerdrSchema> {
-    return { protocol: 16, schema_version: 1, event: { $defs: { EventData: { oneOf: Array.from({ length: 23 }, (_, index) => ({ properties: { type: { const: `event_${index}` } } })) } } } };
+    return { protocol: 16, schema_version: 1, event: { $defs: { EventData: { oneOf: HERDR_EVENT_TYPES.map((type) => ({ properties: { type: { const: type } } })) } } } };
   }
   async integrationStatus(_timeoutMs: number): Promise<IntegrationStatus> {
     return { integrations: ["claude", "codex"].filter((name) => !this.missingIntegrations.includes(name)).map((name) => ({ name, installed: true })) };
