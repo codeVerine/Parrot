@@ -1,6 +1,7 @@
 import { join } from "node:path";
+import type { RuntimeSignal } from "@platform/contracts";
 import type { BuildContext, PromptBuilder, ResultExtractor, TurnType } from "@platform/llm-boundary";
-import { toEngineValidationVerdict } from "@platform/llm-boundary";
+import { sha256Hex, toEngineValidationVerdict } from "@platform/llm-boundary";
 import type { WorkflowEngine } from "@platform/workflow-engine";
 import type { AgentRunner } from "./runner.js";
 
@@ -13,6 +14,7 @@ export type TurnDeps = {
   deadlineMs: number;
   writePrompts: boolean;
   newId: () => string;
+  nowIso: () => string;
 };
 
 export type RunTurnInput = {
@@ -76,6 +78,8 @@ export async function runTurn(deps: TurnDeps, input: RunTurnInput): Promise<Turn
     resultPath,
   });
 
+  signalResultSeen(deps, { workflowId, iterationId, turnId, agentId, resultPath, attempt: "primary", resultText: primary.resultText });
+
   const primaryVerdict = extractor.validate({
     bytes: primary.resultText,
     turn: { workflowId, iterationId, turnId, nonce: built.nonce, turnType, attempt: "primary" },
@@ -111,6 +115,8 @@ export async function runTurn(deps: TurnDeps, input: RunTurnInput): Promise<Turn
     resultPath,
   });
 
+  signalResultSeen(deps, { workflowId, iterationId, turnId, agentId, resultPath, attempt: "repair", resultText: repair.resultText });
+
   const repairVerdict = extractor.validate({
     bytes: repair.resultText,
     turn: { workflowId, iterationId, turnId, nonce: built.nonce, turnType, attempt: "repair" },
@@ -122,4 +128,38 @@ export async function runTurn(deps: TurnDeps, input: RunTurnInput): Promise<Turn
     return { status: "valid", turnId, role: repairVerdict.role, payload: repairVerdict.payload, resultHash: repairVerdict.resultHash };
   }
   return { status: "failed", turnId, reason: repairVerdict.reason };
+}
+
+/**
+ * Advance the turn `waiting -> validating` via a ResultFileSeen signal, as the
+ * runtime adapter would on observing the result file. The content hash is salted
+ * with the attempt so a repair with identical text is not deduped by correlation.
+ */
+function signalResultSeen(
+  deps: TurnDeps,
+  args: {
+    workflowId: string;
+    iterationId: string;
+    turnId: string;
+    agentId: string;
+    resultPath: string;
+    attempt: "primary" | "repair";
+    resultText: string;
+  },
+): void {
+  const signal: RuntimeSignal = {
+    signalId: `${args.turnId}-${args.attempt}-result`,
+    observedAt: deps.nowIso(),
+    source: "fs_watch",
+    classification: "observation",
+    kind: "ResultFileSeen",
+    workflowId: args.workflowId,
+    iterationId: args.iterationId,
+    turnId: args.turnId,
+    agentId: args.agentId,
+    artifactPath: args.resultPath,
+    size: Buffer.byteLength(args.resultText, "utf8"),
+    contentHash: sha256Hex(`${args.attempt}:${args.resultText}`),
+  };
+  deps.engine.handleSignal(signal);
 }

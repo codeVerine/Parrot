@@ -91,6 +91,7 @@ export function createComposition(options: CompositionOptions): Composition {
     deadlineMs: options.deadlineMs ?? 15 * 60 * 1000,
     writePrompts: options.writePrompts ?? true,
     newId: options.newId ?? (() => randomUUID()),
+    nowIso: options.now ?? (() => new Date().toISOString()),
   };
 
   return {

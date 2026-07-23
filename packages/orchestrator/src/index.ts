@@ -20,6 +20,12 @@ export {
   type FixtureResolver,
 } from "./runner.js";
 export {
+  runReviewLoop,
+  type HumanDecisionResolver,
+  type ReviewLoopInput,
+  type ReviewLoopResult,
+} from "./loop.js";
+export {
   runTurn,
   type RunTurnInput,
   type TurnDeps,
