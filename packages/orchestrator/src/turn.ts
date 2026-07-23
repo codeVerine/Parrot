@@ -75,6 +75,8 @@ export async function runTurn(deps: TurnDeps, input: RunTurnInput): Promise<Turn
     nonce: built.nonce,
     promptPath: built.path,
     promptContent: built.content,
+    promptHash: built.promptHash,
+    promptVersion: built.promptVersion,
     resultPath,
   });
 
@@ -112,6 +114,8 @@ export async function runTurn(deps: TurnDeps, input: RunTurnInput): Promise<Turn
     nonce: built.nonce,
     promptPath: repairBuilt.path,
     promptContent: repairBuilt.content,
+    promptHash: repairBuilt.promptHash,
+    promptVersion: repairBuilt.promptVersion,
     resultPath,
   });
 

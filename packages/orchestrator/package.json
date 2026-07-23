@@ -9,13 +9,18 @@
       "import": "./dist/src/index.js"
     }
   },
+  "bin": {
+    "parrot-orchestrate": "./dist/src/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm --filter @platform/contracts build && pnpm --filter @platform/persistence build && pnpm --filter @platform/llm-boundary build && pnpm --filter @platform/workflow-engine build && pnpm --filter @platform/human-loop build && node --import tsx --test test/*.test.ts"
+    "orchestrate": "tsx src/cli.ts",
+    "test": "pnpm --filter @platform/contracts build && pnpm --filter @platform/persistence build && pnpm --filter @platform/llm-boundary build && pnpm --filter @platform/workflow-engine build && pnpm --filter @platform/human-loop build && pnpm --filter @platform/herdr-adapter build && node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@platform/contracts": "workspace:*",
+    "@platform/herdr-adapter": "workspace:*",
     "@platform/human-loop": "workspace:*",
     "@platform/llm-boundary": "workspace:*",
     "@platform/persistence": "workspace:*",

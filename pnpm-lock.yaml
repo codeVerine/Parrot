@@ -137,6 +137,9 @@ importers:
       '@platform/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@platform/herdr-adapter':
+        specifier: workspace:*
+        version: link:../herdr-adapter
       '@platform/human-loop':
         specifier: workspace:*
         version: link:../human-loop

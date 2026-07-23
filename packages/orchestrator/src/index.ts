@@ -20,7 +20,12 @@ export {
   type FixtureResolver,
 } from "./runner.js";
 export {
+  createHerdrRunner,
+  type HerdrRunnerOptions,
+} from "./herdr-runner.js";
+export {
   runReviewLoop,
+  type HumanDecision,
   type HumanDecisionResolver,
   type ReviewLoopInput,
   type ReviewLoopResult,

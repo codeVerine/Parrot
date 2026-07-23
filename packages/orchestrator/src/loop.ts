@@ -4,11 +4,13 @@ import type { ObjectionView } from "@platform/llm-boundary";
 import type { WorkflowEngineConfig, WorkflowPhase } from "@platform/workflow-engine";
 import type { Composition } from "./composition.js";
 
+export type HumanDecision = { decision: "approved" | "rejected"; waiveOpenObjections?: boolean; comment?: string };
+
 export type HumanDecisionResolver = (ctx: {
   workflowId: string;
   openObjectionIds: string[];
   frontierReadiness: "ready" | "not_ready" | null;
-}) => { decision: "approved" | "rejected"; waiveOpenObjections?: boolean; comment?: string };
+}) => HumanDecision | Promise<HumanDecision>;
 
 export type ReviewLoopInput = {
   workflowId: string;
@@ -203,7 +205,7 @@ export async function runReviewLoop(
       engine.advancePlanning(workflowId, "requestHuman");
     }
     if (engine.getState(workflowId).phase === "human_decision") {
-      const decision = input.decide({ workflowId, openObjectionIds: openIds(), frontierReadiness });
+      const decision = await input.decide({ workflowId, openObjectionIds: openIds(), frontierReadiness });
       engine.humanDecision({
         workflowId,
         decision: decision.decision,

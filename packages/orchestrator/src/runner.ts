@@ -12,6 +12,8 @@ export type AgentTurnRequest = {
   nonce: string;
   promptPath: string;
   promptContent: string;
+  promptHash: string;
+  promptVersion: string;
   resultPath: string;
 };
 
