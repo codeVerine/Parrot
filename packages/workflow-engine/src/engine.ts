@@ -399,6 +399,44 @@ export class WorkflowEngine {
     return result.state;
   }
 
+  /**
+   * Record a blocked implementation result. Emits the existing ImplementationBlocked
+   * event (folds to `escalated`) and notifies the human; never a silent stop.
+   */
+  reportImplementationBlocked(input: {
+    workflowId: string;
+    reason: string;
+    iterationId?: string;
+    turnId?: string;
+    agentId?: string;
+    occurredAt?: string;
+  }): FoldedState {
+    const event = asEvent({
+      eventId: String(eventId()),
+      occurredAt: input.occurredAt ?? this.now(),
+      workflowId: input.workflowId,
+      ...(input.iterationId ? { iterationId: input.iterationId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
+      kind: "ImplementationBlocked",
+      payload: { reason: input.reason },
+    });
+    const state = foldReducer(this.getState(input.workflowId), event);
+    const config = this.configFor(input.workflowId);
+    this.commit(input.workflowId, state, [
+      { type: "appendEvent", event },
+      {
+        type: "notifyEscalation",
+        workflowId: input.workflowId,
+        target: config.escalationNotificationTarget,
+        reason: "implementation_blocked",
+        openObjectionIds: openObjectionIds(state),
+      },
+      { type: "saveWorkflowState", workflowId: input.workflowId, status: "escalated", state, config },
+    ]);
+    return state;
+  }
+
   humanDecision(input: HumanDecisionInput): FoldedState {
     const config = this.configFor(input.workflowId);
     const state = this.getState(input.workflowId);

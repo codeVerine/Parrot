@@ -132,6 +132,34 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
+  packages/orchestrator:
+    dependencies:
+      '@platform/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@platform/human-loop':
+        specifier: workspace:*
+        version: link:../human-loop
+      '@platform/llm-boundary':
+        specifier: workspace:*
+        version: link:../llm-boundary
+      '@platform/persistence':
+        specifier: workspace:*
+        version: link:../persistence
+      '@platform/workflow-engine':
+        specifier: workspace:*
+        version: link:../workflow-engine
+    devDependencies:
+      '@types/node':
+        specifier: ^22.9.0
+        version: 22.20.1
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.1
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
   packages/persistence:
     dependencies:
       '@platform/contracts':
