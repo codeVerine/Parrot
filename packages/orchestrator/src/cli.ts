@@ -13,6 +13,7 @@ import {
   type AgentHandle,
 } from "@platform/herdr-adapter";
 import { PersistenceStore } from "@platform/persistence";
+import { resolveCodebaseContext } from "./codebase-context.js";
 import { createComposition } from "./composition.js";
 import { createHerdrRunner } from "./herdr-runner.js";
 import { runReviewLoop, type HumanDecision } from "./loop.js";
@@ -106,6 +107,20 @@ async function main(): Promise<void> {
     task = await readTask(resumeRequest.rest, projectDir);
   }
 
+  const contextDisabled = env.PARROT_CONTEXT_DISABLE === "1";
+  const contextMaxFiles = parseNonNegativeInt(env.PARROT_CONTEXT_MAX_FILES);
+  const contextMaxBytes = parseNonNegativeInt(env.PARROT_CONTEXT_MAX_BYTES);
+  const codebaseContext = contextDisabled
+    ? []
+    : resolveCodebaseContext({
+        projectDir,
+        task,
+        ...(contextMaxFiles !== undefined ? { maxFiles: contextMaxFiles } : {}),
+        ...(contextMaxBytes !== undefined ? { maxTotalBytes: contextMaxBytes } : {}),
+      });
+  const codebaseContextBytes = codebaseContext.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+  console.log(`Codebase context: ${codebaseContext.length} files, ${formatKilobytes(codebaseContextBytes)} KB`);
+
   const rl = createInterface({ input: stdin, output: stdout });
   const decide = async (ctx: {
     openObjectionIds: string[];
@@ -131,6 +146,7 @@ async function main(): Promise<void> {
       reviewerAgentIds: ["reviewer"],
       frontierAgentId: "frontier",
       decide,
+      codebaseContext,
       ...(resumeSeed ? { resume: resumeSeed } : {}),
     });
     console.log(`Review loop finished: phase=${review.phase}, iterations=${review.iterations}`);
@@ -256,6 +272,19 @@ async function readTask(args: string[], projectDir: string): Promise<string> {
   const task = parts.join("\n\n").trim();
   if (!task) throw new Error("Empty task input.");
   return task;
+}
+
+function parseNonNegativeInt(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function formatKilobytes(bytes: number): string {
+  const kb = bytes / 1024;
+  const text = kb.toFixed(1);
+  return text.endsWith(".0") ? text.slice(0, -2) : text;
 }
 
 main().catch((error) => {

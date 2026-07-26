@@ -2,13 +2,13 @@ import type { LlmBoundaryConfig, RoleName } from "./types.js";
 
 export const DEFAULT_LLM_BOUNDARY_CONFIG: LlmBoundaryConfig = {
   rolePromptPins: {
-    planner: { rolePromptId: "planner", version: "1.0.0" },
+    planner: { rolePromptId: "planner", version: "1.1.0" },
     reviewer: { rolePromptId: "reviewer", version: "1.0.0" },
     adversarial: { rolePromptId: "adversarial", version: "1.0.0" },
     verifier: { rolePromptId: "verifier", version: "1.0.0" },
     merge: { rolePromptId: "merge", version: "1.0.0" },
     "planner-compact": { rolePromptId: "planner-compact", version: "1.0.0" },
-    frontier: { rolePromptId: "frontier", version: "1.0.0" },
+    frontier: { rolePromptId: "frontier", version: "1.1.0" },
     implementation: { rolePromptId: "implementation", version: "1.0.0" },
   },
   providerModelByRole: {

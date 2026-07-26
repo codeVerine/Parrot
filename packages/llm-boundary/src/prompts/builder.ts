@@ -7,6 +7,7 @@ import { newNonce, sha256Hex } from "../hash.js";
 import type {
   BuildContext,
   BuiltPrompt,
+  CodebaseContextFile,
   LlmBoundaryConfig,
   ObjectionView,
   TurnIdentity,
@@ -211,6 +212,9 @@ function renderPrompt(args: {
   if (context.task) {
     lines.push("## Task", context.task, "");
   }
+  if (context.codebaseContext?.length) {
+    lines.push(...renderCodebaseContext(sentinel, context.codebaseContext, collectUntrusted));
+  }
   if (context.proposalPath) {
     lines.push(`## Proposal path`, context.proposalPath, "");
   }
@@ -333,6 +337,27 @@ function renderObjectionEvidence(
       collectUntrusted(item);
       lines.push(evidenceBlock(sentinel, objection.id, `evidence-${index}`, item));
     }
+  }
+  return lines;
+}
+
+function renderCodebaseContext(
+  sentinel: string,
+  files: CodebaseContextFile[],
+  collectUntrusted: (value: string) => void,
+): string[] {
+  const lines = ["## Codebase Context"];
+  for (const file of files) {
+    collectUntrusted(file.content);
+    const emittedBytes = Buffer.byteLength(file.content, "utf8");
+    const omittedBytes = Math.max(0, file.bytes - emittedBytes);
+    lines.push(`### ${file.path}`);
+    lines.push(`bytes: ${file.bytes}`);
+    if (file.truncated) {
+      lines.push(`truncated: true (${omittedBytes} bytes omitted)`);
+    }
+    lines.push(evidenceBlock(sentinel, file.path, "content", file.content));
+    lines.push("");
   }
   return lines;
 }

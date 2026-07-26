@@ -1,6 +1,6 @@
 import type { FrontierResult, PlannerResult, ReviewerResult } from "@platform/contracts";
 import { blockingFindings, findingsFromReport } from "@platform/human-loop";
-import type { ObjectionView } from "@platform/llm-boundary";
+import type { CodebaseContextFile, ObjectionView } from "@platform/llm-boundary";
 import type { WorkflowEngineConfig, WorkflowPhase } from "@platform/workflow-engine";
 import type { Composition } from "./composition.js";
 import type { ResumeSeed } from "./resume.js";
@@ -17,6 +17,7 @@ export type ReviewLoopInput = {
   workflowId: string;
   workspaceId: string;
   task: string;
+  codebaseContext?: CodebaseContextFile[];
   plannerAgentId: string;
   /** One turn per id; the last runs as an adversarial review when `adversarial` is set. */
   reviewerAgentIds: string[];
@@ -62,6 +63,8 @@ export async function runReviewLoop(
   let frontierReadiness: "ready" | "not_ready" | null = input.resume ? input.resume.frontierReadiness : null;
   let finalProposalPath: string | undefined = input.resume?.finalProposalPath;
   let proposalSummary: string | undefined = input.resume?.proposalSummary;
+  const codebaseContext = input.codebaseContext ?? [];
+  const codebaseContextArgs = codebaseContext.length > 0 ? { codebaseContext } : {};
   // The loop owns its iteration counter (1-based, +1 per planner round). It is NOT
   // derived from the engine's folded `iterationCount`, which double-counts and is not a
   // usable iteration number. On resume it starts at the interrupted iteration.
@@ -121,7 +124,7 @@ export async function runReviewLoop(
           workflowId,
           iterationId,
           agentId: input.plannerAgentId,
-          context: { task: input.task, openObjections: openViews() },
+          context: { task: input.task, openObjections: openViews(), ...codebaseContextArgs },
           iterationNumber: iteration,
         });
         if (planner.status !== "valid") return finalize({ failedTurnId: planner.turnId });
@@ -165,6 +168,7 @@ export async function runReviewLoop(
               ...(proposalSummary ? { proposalSummary } : {}),
               openObjections: openViews(),
               allObjections: [...views.values()],
+              ...codebaseContextArgs,
             },
           });
           if (reviewer.status !== "valid") continue;
@@ -223,6 +227,7 @@ export async function runReviewLoop(
             proposalPath,
             ...(proposalSummary ? { proposalSummary } : {}),
             allObjections: [...views.values()],
+            ...codebaseContextArgs,
           },
         });
         if (frontier.status !== "valid") {

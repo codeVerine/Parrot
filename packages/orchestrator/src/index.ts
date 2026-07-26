@@ -4,6 +4,9 @@ export {
   type CompositionOptions,
 } from "./composition.js";
 export {
+  resolveCodebaseContext,
+} from "./codebase-context.js";
+export {
   runImplementation,
   runVerification,
   type ImplementationInput,
