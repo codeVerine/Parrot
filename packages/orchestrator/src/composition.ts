@@ -24,7 +24,9 @@ import {
   type VerificationInput,
 } from "./implementation.js";
 import type { AgentRunner } from "./runner.js";
+import { buildResumeSeed, ResumeTurnRegistry, type ResumeSeed } from "./resume.js";
 import { runTurn, type RunTurnInput, type TurnDeps, type TurnOutcome } from "./turn.js";
+import { ResolutionResultSchema } from "@platform/contracts";
 
 export type CompositionOptions = {
   store: PersistenceStore;
@@ -53,6 +55,10 @@ export type Composition = {
     task: string;
     config?: Partial<WorkflowEngineConfig>;
   }): FoldedState;
+  /** Recover an interrupted workflow's folded state and rebuild the loop's scratch. */
+  resumeWorkflow(workflowId: string): ResumeSeed;
+  /** The resume turn registry for the current resume session (null for fresh runs). */
+  resumeRegistry: ResumeTurnRegistry | null;
   runTurn(input: RunTurnInput): Promise<TurnOutcome>;
   runImplementation(input: ImplementationInput): Promise<ImplementationOutcome>;
   runVerification(input: VerificationInput): Promise<TurnOutcome>;
@@ -94,14 +100,38 @@ export function createComposition(options: CompositionOptions): Composition {
     nowIso: options.now ?? (() => new Date().toISOString()),
   };
 
+  // Mutable resume registry - populated by resumeWorkflow(), consumed by runTurn().
+  let resumeRegistry: ResumeTurnRegistry | null = null;
+
   return {
     engine,
     store: options.store,
     humanSink,
+    get resumeRegistry(): ResumeTurnRegistry | null { return resumeRegistry; },
     startWorkflow: (input) => engine.startWorkflow(input),
-    runTurn: (input) => runTurn(deps, input),
-    runImplementation: (input) => runImplementation(deps, input),
-    runVerification: (input) => runVerification(deps, input),
+    resumeWorkflow: (workflowId) => {
+      const seed = buildResumeSeed(engine, options.store, workflowId);
+      resumeRegistry = new ResumeTurnRegistry(options.store, workflowId);
+      return seed;
+    },
+    runTurn: (input) => runTurn(deps, input, resumeRegistry),
+    runImplementation: async (input) => {
+      const result = await runImplementation(deps, input, resumeRegistry);
+      if (result.status === "completed") {
+        options.store.updatePostReviewStage(input.workflowId, "verification_pending");
+      }
+      return result;
+    },
+    runVerification: async (input) => {
+      const result = await runVerification(deps, input, resumeRegistry);
+      if (result.status === "valid") {
+        const parsed = ResolutionResultSchema.safeParse(result.payload);
+        if (parsed.success && parsed.data.verified.includes(input.targetTurnId) && parsed.data.unresolved.length === 0) {
+          options.store.updatePostReviewStage(input.workflowId, "complete");
+        }
+      }
+      return result;
+    },
     humanDecision: (decision) => postHumanDecision({ engine, store: options.store, decision }),
     flush: () => engine.flush(),
   };

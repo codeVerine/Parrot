@@ -13,9 +13,9 @@ import { normalizeStatus, type NormalizedStatus } from "./status.js";
 import { runStartupChecks, degradedSignal, type StartupResult } from "./startup.js";
 import { readSafeArtifact, ResultFileWatcher, ResultWatchStoppedError, ResultWatchTimeoutError, type SafeArtifact } from "./watch.js";
 
-export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string> };
+export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string>; argv?: string[]; cwd?: string; name?: string; tabId?: string };
 export type AgentHandle = { id: AgentId; paneId: string; workflowId: string; provider: string; role: string; sessionId: string | null; sessionPath: string | null };
-export type TurnRequest = { turnId: TurnId; workflowId: string; iterationId: string; promptPath: string; promptHash: string; resultPath: string; schemaId: string; nonce: string; deadline: Date; attempt?: "primary" | "repair" };
+export type TurnRequest = { turnId: TurnId; workflowId: string; iterationId: string; promptPath: string; promptHash: string; resultPath: string; schemaId: string; nonce: string; deadline: Date; idleMs?: number; attempt?: "primary" | "repair" };
 export type DeliveryReceipt = { turnId: TurnId; promptHash: string; deliveredAt: string };
 export type TurnResult = SafeArtifact & { turnId: TurnId };
 export type StatusEvent = { agentId: AgentId | null; paneId: string; rawStatus: "idle" | "working" | "blocked" | "done" | "unknown"; normalizedStatus: NormalizedStatus; completionCandidate: boolean; resultCheckRequested: boolean };
@@ -54,7 +54,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     this.deadlines = new TurnDeadlineManager((signal) => this.emitSignal(signal), options.persistedDeadlines ?? []);
     this.reconciler = new Reconciler(options.client, this.identity, (signal) => this.emitSignal(signal), this.config, () => this.findMissedResults());
     if (options.startup?.degraded) this.emitSignal(degradedSignal(options.startup));
-    void this.subscribe();
+    this.subscribe();
   }
 
   static async create(options: RuntimeOptions & { cli: HerdrCli }): Promise<HerdrAgentRuntime> {
@@ -66,10 +66,14 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async start(spec: AgentSpec): Promise<AgentHandle> {
     if (!spec.provider.trim() || !this.config.supportedProviders.includes(spec.provider)) throw this.spawnFailure(new AgentSpawnError("unsupported_provider", spec.provider, `Unsupported provider: ${spec.provider || "missing"}.`));
     try {
-      const raw = await this.options.client.startAgent({ provider: spec.provider, role: spec.role, workspaceId: spec.workspaceId, worktreeRequired: spec.worktreeRequired, env: spec.env }, this.config.operationTimeoutMs);
+      const argv = spec.argv ?? this.config.providerArgv[spec.provider] ?? [spec.provider];
+      const name = spec.name ?? `${spec.provider}-${spec.role}`;
+      const raw = await this.options.client.startAgent({ name, argv, cwd: spec.cwd ?? null, workspace_id: spec.workspaceId, tab_id: spec.tabId ?? null, env: spec.env }, this.config.operationTimeoutMs);
       const id = spec.id ?? agentId();
       const status = normalizeStatus(raw).normalizedStatus;
       const identity = this.identity.bind({ agentId: id, paneId: raw.pane_id, workflowId: spec.workspaceId, provider: spec.provider, role: spec.role, status, sessionId: raw.agent_session_id, sessionPath: raw.agent_session_path });
+      try { await this.options.client.subscribeAgentStatus(identity.paneId, this.config.operationTimeoutMs); }
+      catch { /* per-pane status stream is best-effort; the fs result watcher drives completion */ }
       return { id, paneId: identity.paneId, workflowId: identity.workflowId, provider: identity.provider, role: identity.role, sessionId: identity.sessionId, sessionPath: identity.sessionPath };
     } catch (error) {
       if (error instanceof AgentSpawnError) throw error;
@@ -95,11 +99,23 @@ export class HerdrAgentRuntime implements AgentRuntime {
     if (identity.status !== "idle" && !(attempt === "repair" && existing)) throw this.deliveryFailure(new TurnDeliveryError("agent_not_idle", String(turn.turnId), attempt, `Agent is ${identity.status}.`));
 
     const sentAtMs = Date.now();
-    const watcher = new ResultFileWatcher(turn.resultPath, { turnDir: dirname(turn.resultPath), sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs }, (signal) => this.emitSignal({ ...signal, workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id) } as RuntimeSignal));
+    // Idle deadline: the turn's `deadline` is the absolute cap; when `idleMs` is set
+    // the timer is armed at now+idleMs and re-armed (up to the cap) on every result-dir
+    // write, so a turn that keeps producing output is not killed by a fixed wall clock,
+    // while a truly silent agent still fails after idleMs. Absent idleMs preserves the
+    // old fixed-deadline behavior.
+    const capMs = turn.deadline.getTime();
+    const idleMs = turn.idleMs;
+    const rearmIdle = idleMs === undefined ? undefined : () => {
+      if (!this.turns.has(key)) return;
+      const next = Math.min(Date.now() + idleMs, capMs);
+      if (next > Date.now()) this.deadlines.arm(String(turn.turnId), new Date(next), attempt);
+    };
+    const watcher = new ResultFileWatcher(turn.resultPath, { turnDir: dirname(turn.resultPath), sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs }, (signal) => this.emitSignal({ ...signal, workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id) } as RuntimeSignal), rearmIdle);
     if (turn.deadline.getTime() > Date.now()) watcher.start();
     const command = `Read ${turn.promptPath} and write the ${turn.attempt === "repair" ? "repair " : ""}result to ${turn.resultPath}; schema=${turn.schemaId}; nonce=${turn.nonce}; promptHash=${turn.promptHash}`;
     try {
-      await this.options.client.sendAgent(identity.paneId, command, this.config.operationTimeoutMs);
+      await this.options.client.sendAgent(identity.paneId, command, turn.promptHash, this.config.operationTimeoutMs, this.options.cli);
     } catch (error) {
       watcher.stop();
       throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), attempt, error instanceof Error ? error.message : String(error)));
@@ -108,7 +124,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
     if (context) { context.request = turn; context.sentAtMs = sentAtMs; context.repairUsed = true; context.resultSeen = false; context.resultRead = false; context.watcher.stop(); context.watcher = watcher; }
     else this.turns.set(key, { agentId: id, request: turn, watcher, sentAtMs, cancelled: false, repairUsed: attempt === "repair", resultSeen: false, resultRead: false });
     this.identity.setStatus(id, "working");
-    this.deadlines.arm(String(turn.turnId), turn.deadline, attempt);
+    const initialDeadline = idleMs === undefined ? turn.deadline : new Date(Math.min(sentAtMs + idleMs, capMs));
+    this.deadlines.arm(String(turn.turnId), initialDeadline, attempt);
     const remainingMs = turn.deadline.getTime() - Date.now();
     if (remainingMs <= 0) return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString() };
     void watcher.wait(remainingMs).then((artifact) => {
@@ -173,6 +190,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async close(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.options.client.close();
     this.deadlines.dispose();
     for (const context of this.turns.values()) context.watcher.stop();
     for (const context of this.orphanTurns.values()) context.watcher.stop();
@@ -196,18 +214,15 @@ export class HerdrAgentRuntime implements AgentRuntime {
     this.identity.setStatus(id, "idle");
   }
 
-  private async subscribe() {
-    try {
-      this.unsubscribe = await this.options.client.subscribeEvents((event) => consumeEvent(event, this.identity, (signal) => {
-        if (signal.kind === "HerdrStatusChanged") {
-          const identity = signal.agentId ? this.identity.get(signal.agentId as AgentId) : undefined;
-          const status: StatusEvent = { agentId: signal.agentId as AgentId | null, paneId: identity?.paneId ?? "", rawStatus: signal.rawStatus, normalizedStatus: signal.normalizedStatus, completionCandidate: signal.hints.completionCandidate, resultCheckRequested: signal.hints.resultCheckRequested };
-          for (const handler of this.statusHandlers) handler(status);
-        }
-        this.emitSignal(signal);
-      }), this.config.operationTimeoutMs);
-    }
-    catch (error) { this.emitError(new ReconnectError(0, error instanceof Error ? error.message : String(error))); }
+  private subscribe() {
+    this.unsubscribe = this.options.client.onEvent((event) => consumeEvent(event, this.identity, (signal) => {
+      if (signal.kind === "HerdrStatusChanged") {
+        const identity = signal.agentId ? this.identity.get(signal.agentId as AgentId) : undefined;
+        const status: StatusEvent = { agentId: signal.agentId as AgentId | null, paneId: identity?.paneId ?? "", rawStatus: signal.rawStatus, normalizedStatus: signal.normalizedStatus, completionCandidate: signal.hints.completionCandidate, resultCheckRequested: signal.hints.resultCheckRequested };
+        for (const handler of this.statusHandlers) handler(status);
+      }
+      this.emitSignal(signal);
+    }));
   }
 
   private handleAgentStatus(id: AgentId, raw: HerdrAgent) {

@@ -7,19 +7,28 @@ export const HERDR_EVENT_TYPES = [
 
 export type HerdrEventType = (typeof HERDR_EVENT_TYPES)[number];
 
+/**
+ * Normalized, flattened event as it reaches {@link consumeEvent}. The live socket
+ * frames pushes as `{event: "pane.agent_status_changed", data: {...}}` with dotted
+ * kinds; the transport translates the dotted kind into this underscore `type` and
+ * spreads `data` before dispatching, so downstream code sees a single flat shape.
+ */
 export type HerdrEvent = {
   type: HerdrEventType;
   workspace_id?: string;
   pane_id?: string;
   agent?: string | null;
-  agent_status?: "idle" | "working" | "blocked" | "done" | "unknown";
+  agent_status?: HerdrAgentStatus;
   custom_status?: string | null;
   [key: string]: unknown;
 };
 
+export type HerdrAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+
+/** Adapter-normalized agent view (mapped from the wire {@link AgentInfo}). */
 export type HerdrAgent = {
   agent?: string | null;
-  agent_status?: "idle" | "working" | "blocked" | "done" | "unknown";
+  agent_status?: HerdrAgentStatus;
   cwd?: string | null;
   name?: string | null;
   pane_id: string;
@@ -42,12 +51,43 @@ export type IntegrationStatus = {
   [key: string]: unknown;
 };
 
+/** Wire params for `agent.start` (Herdr protocol 16 `AgentStartParams`). */
 export type AgentStartSpec = {
-  provider: string;
-  role: string;
-  workspaceId: string;
-  worktreeRequired: boolean;
+  name: string;
+  argv: string[];
+  cwd?: string | null;
+  workspace_id?: string | null;
+  tab_id?: string | null;
   env?: Record<string, string>;
+  focus?: boolean;
+};
+
+/** Wire agent record returned by `agent.start` / `agent.get` / `agent.list`. */
+export type AgentSessionInfo = { source: string; agent: string; kind: "id" | "path"; value: string };
+export type AgentInfo = {
+  pane_id: string;
+  terminal_id: string;
+  workspace_id: string;
+  tab_id: string;
+  agent_status: HerdrAgentStatus;
+  agent?: string | null;
+  name?: string | null;
+  cwd?: string | null;
+  agent_session?: AgentSessionInfo | null;
+  focused: boolean;
+  revision: number;
+};
+
+/** Wire push payload for `pane.agent_status_changed` subscription events. */
+export type PaneAgentStatusChangedData = {
+  pane_id: string;
+  workspace_id: string;
+  agent_status: HerdrAgentStatus;
+  agent?: string | null;
+  custom_status?: string | null;
+  display_agent?: string | null;
+  title?: string | null;
+  state_labels?: Record<string, string>;
 };
 
 export type HerdrSnapshot = {
@@ -55,4 +95,16 @@ export type HerdrSnapshot = {
   workspace_id?: string;
   agents?: HerdrAgent[];
   [key: string]: unknown;
+};
+
+/** Wire result for `pane.read`. */
+export type PaneReadResult = {
+  pane_id: string;
+  workspace_id: string;
+  tab_id: string;
+  source: string;
+  format: string;
+  text: string;
+  revision: number;
+  truncated: boolean;
 };

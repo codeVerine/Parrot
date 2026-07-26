@@ -54,11 +54,14 @@ export class ResultFileWatcher {
   private wakeups: Array<() => void> = [];
   private pollTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly resultPath: string, private readonly config: ArtifactSafetyConfig, private readonly emit: WatchEmit) {}
+  constructor(private readonly resultPath: string, private readonly config: ArtifactSafetyConfig, private readonly emit: WatchEmit, private readonly onActivity?: () => void) {}
 
   start() {
     try {
-      this.watcher = fsWatch(dirname(this.resultPath), () => this.wake());
+      // A real fs event in the turn dir (the agent writing proposal.md, a partial
+      // result, etc.) is a liveness signal; poll-timer wakeups are not, so only the
+      // watcher callback reports activity.
+      this.watcher = fsWatch(dirname(this.resultPath), () => { this.onActivity?.(); this.wake(); });
       this.watcher.on("error", (error) => { this.emitWatchFailure(error); this.startPolling(); });
     } catch (error) {
       this.emitWatchFailure(error); this.startPolling();

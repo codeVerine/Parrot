@@ -106,6 +106,19 @@ export class PersistenceTransaction {
     `).run(input.objectionId, input.workflowId, input.iterationId, input.turnId, input.dimension, input.severity, input.claim, encodeToon({ evidence: input.evidence }), input.evidenceMissing ? 1 : 0, input.status, input.raisedBy, input.clusterId ?? null, now);
   }
 
+  /** Update only the status of an objection row, preserving all other fields. */
+  updateObjectionStatus(objectionId: string, status: string): void {
+    this.db.prepare(`
+      UPDATE objections SET status = ?, updated_at = ? WHERE objection_id = ?
+    `).run(status, new Date().toISOString(), objectionId);
+  }
+
+  updatePostReviewStage(workflowId: string, stage: string): void {
+    this.db.prepare(`
+      UPDATE workflows SET post_review_stage = ?, updated_at = ? WHERE workflow_id = ?
+    `).run(stage, new Date().toISOString(), workflowId);
+  }
+
   saveDecision(input: DecisionInput): void {
     const now = input.createdAt ?? new Date().toISOString();
     const decision = DecisionSchema.parse({
@@ -215,6 +228,8 @@ export class PersistenceStore {
   saveAgent(input: AgentInput): void { this.transaction((tx) => tx.saveAgent(input)); }
   saveRequirement(input: RequirementInput): void { this.transaction((tx) => tx.saveRequirement(input)); }
   saveObjection(input: ObjectionInput): void { this.transaction((tx) => tx.saveObjection(input)); }
+  updateObjectionStatus(objectionId: string, status: string): void { this.transaction((tx) => tx.updateObjectionStatus(objectionId, status)); }
+  updatePostReviewStage(workflowId: string, stage: string): void { this.transaction((tx) => tx.updatePostReviewStage(workflowId, stage)); }
   saveDecision(input: DecisionInput): void { this.transaction((tx) => tx.saveDecision(input)); }
   saveHumanFeedback(input: HumanFeedbackInput): void { this.transaction((tx) => tx.saveHumanFeedback(input)); }
   saveArtifact(input: ArtifactInput): void { this.transaction((tx) => tx.saveArtifact(input)); }
@@ -257,6 +272,21 @@ export class PersistenceStore {
   getWorkflow(workflowId: string): Row | null {
     const row = this.db.prepare("SELECT * FROM workflows WHERE workflow_id = ?").get(workflowId);
     return row ? (row as Row) : null;
+  }
+
+  /**
+   * Workflows that have not reached a terminal review outcome, newest first. Used to
+   * auto-select which run to resume when no explicit id is given. `status` is derived
+   * from the folded phase on every state write (see planning `persist`), so a running
+   * workflow keeps `running` until it reaches `approved`/`rejected`/`escalated`.
+   */
+  listResumableWorkflows(): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare(`
+      SELECT * FROM workflows
+      WHERE status = 'running'
+         OR (status = 'approved' AND (post_review_stage IS NULL OR post_review_stage != 'complete'))
+      ORDER BY updated_at DESC
+    `).all() as Row[];
   }
 
   getTurn(turnId: string): Row | null {

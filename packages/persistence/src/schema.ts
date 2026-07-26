@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export const PERSISTED_TABLES = [
   "workflows",
@@ -226,6 +226,7 @@ export const MIGRATIONS: readonly string[] = [
       SELECT RAISE(ABORT, 'events are append-only; only dispatched_at may be set once');
     END;
   `,
+  `ALTER TABLE workflows ADD COLUMN post_review_stage TEXT DEFAULT NULL;`,
 ];
 
 export function schemaTables(): readonly PersistedTable[] { return PERSISTED_TABLES; }

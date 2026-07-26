@@ -138,6 +138,9 @@ export class WorkflowEngine {
   }
 
   startTurn(turn: Omit<TurnRecord, "state"> & { state?: TurnState; iterationNumber?: number }): TurnRecord {
+    if (this.store.getTurn(turn.turnId)) {
+      throw new Error(`Turn ${turn.turnId} already exists.`);
+    }
     const record: TurnRecord = { ...turn, state: "created", attempt: turn.attempt ?? "primary" };
     this.store.transaction((tx) => {
       tx.saveIteration({
@@ -456,6 +459,42 @@ export class WorkflowEngine {
       state,
       pendingDeadlines: snapshot.pendingDeadlines.filter((item) => this.loadTurn(item.turnId)?.workflowId === workflowId),
     };
+  }
+
+  /**
+   * Prime the in-memory folded state from the durable workflow snapshot so an
+   * interrupted workflow resumes at the exact planning phase it stopped at. The event
+   * log alone cannot do this: fine-grained planning transitions (planner_turn ->
+   * spawn_reviewers -> ... -> objection_gate) are persisted only in the workflow
+   * `state_toon` snapshot, never as events, so {@link fold} would collapse them back to
+   * `planner_turn`. The stripped dedup set `seenIterationIds` is rebuilt from the
+   * distinct iteration ids in the turn log.
+   */
+  rehydrateFromSnapshot(workflowId: string): FoldedState {
+    const row = this.store.getWorkflow(workflowId);
+    if (!row) throw new Error(`Cannot resume unknown workflow ${workflowId}.`);
+    let snapshot: unknown;
+    try {
+      snapshot = parseToon(String(row.state_toon ?? ""));
+    } catch (error) {
+      throw new Error(
+        `Workflow ${workflowId} has malformed state_toon; cannot resume. ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!snapshot || typeof snapshot !== "object") {
+      throw new Error(`Workflow ${workflowId} has non-object state_toon; cannot resume.`);
+    }
+    const seenIterationIds = [
+      ...new Set(this.store.listTurns(workflowId).map((turn) => String(turn.iteration_id)).filter(Boolean)),
+    ];
+    const state: FoldedState = {
+      ...initialFoldedState(workflowId),
+      ...(snapshot as Partial<FoldedState>),
+      workflowId,
+      seenIterationIds,
+    };
+    this.states.set(workflowId, state);
+    return state;
   }
 
   private commit(

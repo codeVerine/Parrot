@@ -118,3 +118,13 @@ test("duplicate ResultFileSeen correlation is a no-op", () => {
   assert.equal(again.reason, "duplicate_correlation");
   assert.equal(turnState(store, "turn-1"), "validating");
 });
+
+test("startTurn rejects duplicate turn IDs", () => {
+  const { store, engine } = createEngine();
+  seedWorkflow(engine);
+  engine.startTurn(sampleTurn());
+  assert.throws(() => engine.startTurn(sampleTurn()), { message: /already exists/ });
+  // Original turn remains unchanged
+  const row = store.getTurn("turn-1");
+  assert.equal(String(row?.state), "created");
+});

@@ -1,4 +1,5 @@
 import type { ImplementationResult } from "@platform/contracts";
+import type { ResumeTurnRegistry } from "./resume.js";
 import type { TurnDeps, TurnOutcome } from "./turn.js";
 import { runTurn } from "./turn.js";
 
@@ -26,6 +27,7 @@ export type ImplementationOutcome =
 export async function runImplementation(
   deps: TurnDeps,
   input: ImplementationInput,
+  resumeRegistry?: ResumeTurnRegistry | null,
 ): Promise<ImplementationOutcome> {
   const turn = await runTurn(deps, {
     turnType: "implementation",
@@ -38,7 +40,7 @@ export async function runImplementation(
       ...(input.proposalSummary ? { proposalSummary: input.proposalSummary } : {}),
     },
     ...(input.iterationNumber !== undefined ? { iterationNumber: input.iterationNumber } : {}),
-  });
+  }, resumeRegistry);
 
   if (turn.status === "failed") {
     return { status: "failed", turnId: turn.turnId, reason: turn.reason };
@@ -86,6 +88,7 @@ export type VerificationInput = {
 export async function runVerification(
   deps: TurnDeps,
   input: VerificationInput,
+  resumeRegistry?: ResumeTurnRegistry | null,
 ): Promise<TurnOutcome> {
   return runTurn(deps, {
     turnType: "resolution_verification",
@@ -100,5 +103,5 @@ export async function runVerification(
       },
     },
     ...(input.iterationNumber !== undefined ? { iterationNumber: input.iterationNumber } : {}),
-  });
+  }, resumeRegistry);
 }

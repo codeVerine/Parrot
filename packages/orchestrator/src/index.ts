@@ -32,7 +32,19 @@ export {
 } from "./loop.js";
 export {
   runTurn,
+  adoptResumeCandidate,
   type RunTurnInput,
   type TurnDeps,
   type TurnOutcome,
 } from "./turn.js";
+export {
+  buildResumeSeed,
+  collectResumeCandidates,
+  rehydrateViews,
+  reuseImplementation,
+  selectResumeWorkflowId,
+  verificationCompleted,
+  ResumeTurnRegistry,
+  type ResumableTurn,
+  type ResumeSeed,
+} from "./resume.js";
