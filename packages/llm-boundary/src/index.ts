@@ -44,6 +44,7 @@ export { isUntrustedText, untrusted } from "./types.js";
 export type {
   BuildContext,
   BuiltPrompt,
+  CodebaseContextFile,
   ClusteredObjection,
   DecisionView,
   EngineValidationVerdict,

@@ -4,6 +4,9 @@ export {
   type CompositionOptions,
 } from "./composition.js";
 export {
+  resolveCodebaseContext,
+} from "./codebase-context.js";
+export {
   runImplementation,
   runVerification,
   type ImplementationInput,
@@ -24,12 +27,19 @@ export {
   type HerdrRunnerOptions,
 } from "./herdr-runner.js";
 export {
+  findStoredAgentSession,
+  workflowRoleAgentKey,
+} from "./agent-session.js";
+export {
   runReviewLoop,
   type HumanDecision,
   type HumanDecisionResolver,
   type ReviewLoopInput,
   type ReviewLoopResult,
+  type StalemateChoice,
+  type StalemateResolver,
 } from "./loop.js";
+export { buildStalemateReport, buildChurnReport } from "./escalation-report.js";
 export {
   runTurn,
   adoptResumeCandidate,
@@ -48,3 +58,17 @@ export {
   type ResumableTurn,
   type ResumeSeed,
 } from "./resume.js";
+export {
+  addedRemovedHeadings,
+  headingChangeRatio,
+  isMajorRestructuring,
+  loadProposalAtIteration,
+  proposalSimilarity,
+  sectionHeadings,
+  sectionSteps,
+  weightedProposalSimilarity,
+  sectionWeightedSimilarity,
+  type ProposalSnapshot,
+  type RestructuringOptions,
+  type WeightedProposalSimilarity,
+} from "./proposal-diff.js";

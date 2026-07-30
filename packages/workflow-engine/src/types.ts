@@ -50,6 +50,8 @@ export type FoldedObjection = {
   objectionId: string;
   severity: "blocking" | "major" | "minor";
   status: "open" | "accepted" | "rejected" | "superseded" | "resolved" | "waived";
+  /** Incremented only when a raise follows a `resolved` status; a stalemate signal. */
+  reraiseCount: number;
 };
 
 export type OrphanLink = {

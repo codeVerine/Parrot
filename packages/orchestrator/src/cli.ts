@@ -1,8 +1,12 @@
+#!/usr/bin/env node
+
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { argv, cwd as processCwd, env, exit, stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
+import { agentId } from "@platform/contracts";
 import {
   defaultHerdrSocketPath,
   discoverHerdrSocket,
@@ -13,9 +17,12 @@ import {
   type AgentHandle,
 } from "@platform/herdr-adapter";
 import { PersistenceStore } from "@platform/persistence";
+import { findStoredAgentSession, workflowRoleAgentKey } from "./agent-session.js";
+import { resolveCodebaseContext } from "./codebase-context.js";
 import { createComposition } from "./composition.js";
 import { createHerdrRunner } from "./herdr-runner.js";
-import { runReviewLoop, type HumanDecision } from "./loop.js";
+import { runReviewLoop, type HumanDecision, type StalemateChoice } from "./loop.js";
+import { ensureWorktree } from "./worktree.js";
 import {
   reuseImplementation,
   selectResumeWorkflowId,
@@ -30,47 +37,143 @@ const ROLE_SPECS: RoleSpec[] = [
   { id: "reviewer", provider: env.PARROT_REVIEWER_PROVIDER ?? "codex", role: "reviewer", worktreeRequired: false },
   { id: "frontier", provider: env.PARROT_FRONTIER_PROVIDER ?? "claude", role: "frontier", worktreeRequired: false },
   { id: "implementation", provider: env.PARROT_IMPL_PROVIDER ?? "claude", role: "implementation", worktreeRequired: true },
-  { id: "verifier", provider: env.PARROT_VERIFIER_PROVIDER ?? "codex", role: "verifier", worktreeRequired: false },
+  { id: "verifier", provider: env.PARROT_VERIFIER_PROVIDER ?? "codex", role: "verifier", worktreeRequired: true },
 ];
 
+function printHelp(): void {
+  stdout.write(
+    [
+      "Usage:",
+      "  parrot [--resume [workflowId]] <task.md | prompt text ...>",
+      "",
+      "Notes:",
+      "  - Run inside (or point PARROT_PROJECT_DIR at) a git repo.",
+      "  - Requires a running Herdr daemon unless using --help/--version.",
+      "",
+    ].join("\n"),
+  );
+}
+
+function printVersion(): void {
+  // Keep this simple: the authoritative version lives in package.json.
+  stdout.write("parrot\n");
+}
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function worktreeEvidence(worktreePath: string): string[] {
+  const branch = (() => { try { return git(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]); } catch { return "(unknown)"; } })();
+  const head = (() => { try { return git(worktreePath, ["rev-parse", "HEAD"]); } catch { return "(unknown)"; } })();
+  const status = (() => { try { return git(worktreePath, ["status", "--porcelain=v1"]); } catch { return "(unavailable)"; } })();
+  const diffNames = (() => { try { return git(worktreePath, ["diff", "--name-status"]); } catch { return "(unavailable)"; } })();
+  const diffStat = (() => { try { return git(worktreePath, ["diff", "--stat"]); } catch { return "(unavailable)"; } })();
+  return [
+    `worktree: ${worktreePath}`,
+    `branch: ${branch}`,
+    `head: ${head}`,
+    `git status --porcelain=v1:\n${status || "(clean)"}`,
+    `git diff --name-status:\n${diffNames || "(none)"}`,
+    `git diff --stat:\n${diffStat || "(none)"}`,
+  ];
+}
+
 async function main(): Promise<void> {
+  const rawArgs = argv.slice(2);
+  if (rawArgs.includes("--help") || rawArgs.includes("-h") || rawArgs[0] === "help") {
+    printHelp();
+    return;
+  }
+  if (rawArgs.includes("--version") || rawArgs.includes("-v")) {
+    printVersion();
+    return;
+  }
+
   // The directory agents operate in and every relative path is anchored to. `pnpm`
   // rewrites process.cwd() to the package dir, so INIT_CWD (the shell's dir when the
   // user invoked parrot) is the correct default; PARROT_PROJECT_DIR overrides it.
   const projectDir = resolve(env.PARROT_PROJECT_DIR ?? env.INIT_CWD ?? processCwd());
-  const resumeRequest = parseResumeRequest(argv.slice(2));
-  const herdrBin = env.HERDR_BIN ?? "herdr";
-  const socketPath = await resolveSocketPath(herdrBin);
-
-  const client = new Protocol16SocketClient(new LineSocketTransport(socketPath));
-  const cli = new HerdrCommandLine(herdrBin);
-  const runtime = await HerdrAgentRuntime.create({ client, cli });
-
-  const workspaceId = env.PARROT_WORKSPACE ?? (await resolveFocusedWorkspace(client));
-
-  // Spawn every agent into a dedicated tab so they do not split the caller's terminal
-  // pane down to an unreadable size. PARROT_TAB reuses an existing tab if provided.
-  const tabId = env.PARROT_TAB ?? (await client.createTab(workspaceId, "parrot agents", 10_000));
-
-  const handles = new Map<string, AgentHandle>();
-  for (const spec of ROLE_SPECS) {
-    handles.set(
-      spec.id,
-      await runtime.start({
-        provider: spec.provider,
-        role: spec.role,
-        workspaceId,
-        tabId,
-        cwd: projectDir,
-        worktreeRequired: spec.worktreeRequired,
-      }),
-    );
-  }
+  const resumeRequest = parseResumeRequest(rawArgs);
 
   // Absolute so the paths embedded in each agent's command resolve no matter what
   // directory the agent's shell starts in.
   const runsRoot = resolve(projectDir, env.PARROT_RUNS_ROOT ?? "runs");
   const store = new PersistenceStore({ path: env.PARROT_DB ?? resolve(runsRoot, "parrot.db") });
+
+  // Select the workflow before starting any role panes so resume-time provider-session
+  // reattach is scoped to the correct workflow.
+  const workflowId = resumeRequest.requested
+    ? selectResumeWorkflowId(store, resumeRequest.workflowId)
+    : env.PARROT_WORKFLOW ?? `wf-${Date.now()}`;
+
+  const herdrBin = env.HERDR_BIN ?? "herdr";
+  const socketPath = await resolveSocketPath(herdrBin);
+  const client = new Protocol16SocketClient(new LineSocketTransport(socketPath));
+  const cli = new HerdrCommandLine(herdrBin);
+  const runtime = await HerdrAgentRuntime.create({ client, cli });
+
+  const storedWorkspaceId = resumeRequest.requested
+    ? String(store.readRows("workflows").find((row) => String(row.workflow_id) === workflowId)?.workspace_id ?? "")
+    : "";
+  const workspaceId =
+    env.PARROT_WORKSPACE ??
+    (storedWorkspaceId.trim() ? storedWorkspaceId : await resolveFocusedWorkspace(client));
+
+  // Spawn agents into one dedicated tab so they do not split the caller's terminal
+  // pane down to an unreadable size. Individual role panes are started lazily;
+  // PARROT_TAB reuses an existing tab if provided.
+  const tabId = env.PARROT_TAB ?? (await client.createTab(workspaceId, "parrot agents", 10_000));
+
+  const worktreeRoot = env.PARROT_WORKTREE_ROOT ? resolve(projectDir, env.PARROT_WORKTREE_ROOT) : undefined;
+
+  const specsById = new Map(ROLE_SPECS.map((spec) => [spec.id, spec]));
+  const handles = new Map<string, Promise<AgentHandle>>();
+  const getHandle = async (id: string): Promise<AgentHandle> => {
+    const cached = handles.get(id);
+    if (cached) return cached;
+    const spec = specsById.get(id);
+    if (!spec) throw new Error(`No role specification for ${id}`);
+    const agentKey = workflowRoleAgentKey(workflowId, spec.id);
+    const usesWorkflowWorktree = spec.worktreeRequired === true;
+    const cwd = usesWorkflowWorktree
+      ? ensureWorktree({ projectDir, workflowId, ...(worktreeRoot ? { worktreeRoot } : {}) }).path
+      : projectDir;
+    const resume = resumeRequest.requested
+      ? findStoredAgentSession(store, workflowId, spec.id, spec.provider, workspaceId)
+      : undefined;
+    const starting = runtime.start({
+      id: agentId(agentKey),
+      provider: spec.provider,
+      role: spec.role,
+      workspaceId,
+      tabId,
+      cwd,
+      worktreeRequired: spec.worktreeRequired,
+      ...(resume ? { resume } : {}),
+    });
+    const cachedStart = starting.then((handle) => {
+      store.saveAgent({
+        agentId: agentKey,
+        paneId: handle.paneId,
+        workspaceId,
+        provider: spec.provider,
+        role: spec.role,
+        sessionId: handle.sessionId,
+        sessionPath: handle.sessionPath,
+        status: "idle",
+      });
+      return handle;
+    });
+    handles.set(id, cachedStart);
+    try {
+      return await cachedStart;
+    } catch (error) {
+      handles.delete(id);
+      throw error;
+    }
+  };
+
   const turnMaxMs = env.PARROT_TURN_MAX_MS
     ? Number(env.PARROT_TURN_MAX_MS)
     : env.PARROT_TURN_TIMEOUT_MS
@@ -79,7 +182,7 @@ async function main(): Promise<void> {
   const turnIdleMs = env.PARROT_TURN_IDLE_TIMEOUT_MS ? Number(env.PARROT_TURN_IDLE_TIMEOUT_MS) : undefined;
   const runner = createHerdrRunner({
     runtime,
-    handles,
+    getHandle,
     ...(turnMaxMs ? { maxMs: turnMaxMs } : {}),
     ...(turnIdleMs ? { idleTimeoutMs: turnIdleMs } : {}),
   });
@@ -93,18 +196,29 @@ async function main(): Promise<void> {
   // Resume an interrupted workflow from its persisted state, or start a fresh run. On
   // resume the task comes from the stored workflow row (not the CLI args) and the loop
   // re-enters at the recovered phase instead of replanning from iteration 1.
-  let workflowId: string;
   let task: string;
   let resumeSeed: ResumeSeed | undefined;
   if (resumeRequest.requested) {
-    workflowId = selectResumeWorkflowId(store, resumeRequest.workflowId);
     resumeSeed = comp.resumeWorkflow(workflowId);
     task = resumeSeed.task;
     console.log(`Resuming workflow ${workflowId} at phase=${resumeSeed.phase}, iteration=${resumeSeed.iteration}.`);
   } else {
-    workflowId = env.PARROT_WORKFLOW ?? `wf-${Date.now()}`;
     task = await readTask(resumeRequest.rest, projectDir);
   }
+
+  const contextDisabled = env.PARROT_CONTEXT_DISABLE === "1";
+  const contextMaxFiles = parseNonNegativeInt(env.PARROT_CONTEXT_MAX_FILES);
+  const contextMaxBytes = parseNonNegativeInt(env.PARROT_CONTEXT_MAX_BYTES);
+  const codebaseContext = contextDisabled
+    ? []
+    : resolveCodebaseContext({
+        projectDir,
+        task,
+        ...(contextMaxFiles !== undefined ? { maxFiles: contextMaxFiles } : {}),
+        ...(contextMaxBytes !== undefined ? { maxTotalBytes: contextMaxBytes } : {}),
+      });
+  const codebaseContextBytes = codebaseContext.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+  console.log(`Codebase context: ${codebaseContext.length} files, ${formatKilobytes(codebaseContextBytes)} KB`);
 
   const rl = createInterface({ input: stdin, output: stdout });
   const decide = async (ctx: {
@@ -122,6 +236,21 @@ async function main(): Promise<void> {
     return { decision: approved ? "approved" : "rejected", waiveOpenObjections: ctx.openObjectionIds.length > 0 };
   };
 
+  const onStalemate = async (ctx: { objectionIds: string[]; report: string; reason: string }): Promise<StalemateChoice> => {
+    console.log("\n" + ctx.report + "\n");
+    const label = ctx.reason === "plan_churn" ? "Plan churn" : ctx.reason === "guardrail_conflict" ? "Guardrail conflict" : "Objection stalemate";
+    const answer = (
+      await rl.question(
+        `${label} on ${ctx.objectionIds.join(", ")}. accept_mitigation/accept_objection/abort? `,
+      )
+    )
+      .trim()
+      .toLowerCase();
+    if (answer.startsWith("accept_m") || answer === "m") return "accept_mitigation";
+    if (answer.startsWith("accept_o") || answer === "o") return "accept_objection";
+    return "abort";
+  };
+
   try {
     const review = await runReviewLoop(comp, {
       workflowId,
@@ -131,9 +260,15 @@ async function main(): Promise<void> {
       reviewerAgentIds: ["reviewer"],
       frontierAgentId: "frontier",
       decide,
+      onStalemate,
+      onProgress: (line) => console.log(line),
+      codebaseContext,
       ...(resumeSeed ? { resume: resumeSeed } : {}),
     });
     console.log(`Review loop finished: phase=${review.phase}, iterations=${review.iterations}`);
+    if (review.escalation) {
+      console.log(`Escalation: ${review.escalation.reason} (${review.escalation.objectionIds.join(", ")})`);
+    }
 
     if (review.phase === "approved") {
       const iterationId = `${workflowId}-impl`;
@@ -145,7 +280,7 @@ async function main(): Promise<void> {
       if (reused) {
         implTurnId = reused.turnId;
         implSummary = reused.summary;
-        console.log("Implementation: reused (completed before interruption)");
+        console.log("[implementation post-review] reused (completed before interruption)");
       } else {
         const impl = await comp.runImplementation({
           workflowId,
@@ -154,7 +289,7 @@ async function main(): Promise<void> {
           task,
           ...(review.finalProposalPath ? { proposalPath: review.finalProposalPath } : {}),
         });
-        console.log(`Implementation: ${impl.status}`);
+        console.log(`[implementation post-review] status=${impl.status}`);
         if (impl.status === "completed") {
           implTurnId = impl.turnId;
           implSummary = impl.summary;
@@ -163,18 +298,19 @@ async function main(): Promise<void> {
 
       if (implTurnId !== undefined && implSummary !== undefined) {
         if (verificationCompleted(store, workflowId, iterationId, implTurnId)) {
-          console.log("Verification: reused (completed before interruption)");
+          console.log("[verification post-review] reused (completed before interruption)");
           store.updatePostReviewStage(workflowId, "complete");
         } else {
+          const worktree = ensureWorktree({ projectDir, workflowId, ...(worktreeRoot ? { worktreeRoot } : {}) });
           const verify = await comp.runVerification({
             workflowId,
             iterationId,
             agentId: "verifier",
             targetTurnId: implTurnId,
             summary: implSummary,
-            evidence: [],
+            evidence: worktreeEvidence(worktree.path),
           });
-          console.log(`Verification: ${verify.status}`);
+          console.log(`[verification post-review] status=${verify.status}`);
         }
       }
     }
@@ -243,7 +379,7 @@ function parseResumeRequest(args: string[]): { requested: boolean; workflowId?: 
 
 async function readTask(args: string[], projectDir: string): Promise<string> {
   if (args.length === 0) {
-    throw new Error("Usage: parrot-orchestrate <task.md | prompt text ...>");
+    throw new Error("Usage: parrot <task.md | prompt text ...>");
   }
   const parts: string[] = [];
   for (const arg of args) {
@@ -256,6 +392,19 @@ async function readTask(args: string[], projectDir: string): Promise<string> {
   const task = parts.join("\n\n").trim();
   if (!task) throw new Error("Empty task input.");
   return task;
+}
+
+function parseNonNegativeInt(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function formatKilobytes(bytes: number): string {
+  const kb = bytes / 1024;
+  const text = kb.toFixed(1);
+  return text.endsWith(".0") ? text.slice(0, -2) : text;
 }
 
 main().catch((error) => {

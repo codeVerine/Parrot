@@ -69,10 +69,12 @@ export function foldReducer(state: FoldedState, event: PlatformEvent): FoldedSta
     }
     case "ObjectionRaised": {
       if (event.kind !== "ObjectionRaised") return next;
+      const existing = next.objections[event.payload.objectionId];
       next.objections[event.payload.objectionId] = {
         objectionId: event.payload.objectionId,
         severity: event.payload.severity,
         status: "open",
+        reraiseCount: existing?.status === "resolved" ? existing.reraiseCount + 1 : existing?.reraiseCount ?? 0,
       };
       return next;
     }
@@ -130,6 +132,18 @@ export function foldReducer(state: FoldedState, event: PlatformEvent): FoldedSta
       return next;
     }
     case "ImplementationBlocked": {
+      setPhase(next, "escalated");
+      return next;
+    }
+    case "ObjectionStalemate": {
+      setPhase(next, "escalated");
+      return next;
+    }
+    case "GuardrailConflict": {
+      setPhase(next, "escalated");
+      return next;
+    }
+    case "PlanChurnDetected": {
       setPhase(next, "escalated");
       return next;
     }

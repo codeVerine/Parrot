@@ -71,6 +71,17 @@ export function toPersistedFoldedState(state: FoldedState): FoldedState {
   };
 }
 
+/** A durable snapshot written before Phase 9 lacks `reraiseCount`; default it to 0. */
+function normalizeFoldedObjections(
+  objections: FoldedState["objections"] | undefined,
+): Record<string, FoldedState["objections"][string]> {
+  const result: Record<string, FoldedState["objections"][string]> = {};
+  for (const [id, objection] of Object.entries(objections ?? {})) {
+    result[id] = { ...objection, reraiseCount: objection.reraiseCount ?? 0 };
+  }
+  return result;
+}
+
 export function repairPromptPath(promptPath: string): string {
   if (!promptPath.endsWith("prompt.md")) {
     throw new Error(`Cannot derive repair prompt from path that does not end with prompt.md: ${promptPath}`);
@@ -262,11 +273,20 @@ export class WorkflowEngine {
     ]);
   }
 
-  resolveObjection(input: { workflowId: string; objectionId: string; resolution: string; occurredAt?: string }): void {
+  resolveObjection(input: {
+    workflowId: string;
+    objectionId: string;
+    resolution: string;
+    iterationId?: string;
+    turnId?: string;
+    occurredAt?: string;
+  }): void {
     const event = asEvent({
       eventId: String(eventId()),
       occurredAt: input.occurredAt ?? this.now(),
       workflowId: input.workflowId,
+      ...(input.iterationId ? { iterationId: input.iterationId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
       kind: "ObjectionResolved",
       payload: { objectionId: input.objectionId, resolution: input.resolution },
     });
@@ -354,7 +374,18 @@ export class WorkflowEngine {
       | "evaluateObjectionGate"
       | "enterFrontier"
       | "requestHuman",
-    options: { nextIterationId?: string; frontierBlocking?: boolean } = {},
+    options: {
+      nextIterationId?: string;
+      frontierBlocking?: boolean;
+      /**
+       * Suppress the escalation notification that the engine would
+       * otherwise emit on this step. Use when the caller (e.g. the
+       * review loop) will prompt the human interactively and would
+       * otherwise receive a duplicate notification before the prompt.
+       * Has no effect on steps that do not produce notifications.
+       */
+      notify?: boolean;
+    } = {},
   ): FoldedState {
     const config = this.configFor(workflowId);
     const state = this.getState(workflowId);
@@ -383,7 +414,10 @@ export class WorkflowEngine {
       : reducePlanning(state, config, { type: step, workflowId });
 
     if (!result.accepted) throw new Error(result.reason ?? `planning step ${step} rejected`);
-    this.commit(workflowId, result.state, result.effects);
+    const effects = options.notify === false
+      ? result.effects.filter((effect) => effect.type !== "notifyEscalation")
+      : result.effects;
+    this.commit(workflowId, result.state, effects);
     return result.state;
   }
 
@@ -435,6 +469,110 @@ export class WorkflowEngine {
         reason: "implementation_blocked",
         openObjectionIds: openObjectionIds(state),
       },
+      { type: "saveWorkflowState", workflowId: input.workflowId, status: "escalated", state, config },
+    ]);
+    return state;
+  }
+
+  /**
+   * Record plan churn: the proposal at the current iteration substantially matches
+   * iteration N-2. Emits PlanChurnDetected (folds to `escalated`) and notifies the
+   * human; mirrors {@link reportGuardrailConflict}.
+   */
+  reportPlanChurn(input: {
+    workflowId: string;
+    fromIterationId: string;
+    toIterationId: string;
+    similarity: number;
+    detail: string;
+    iterationId?: string;
+    turnId?: string;
+    agentId?: string;
+    occurredAt?: string;
+    /**
+     * Suppress the escalation notification. Use when the caller (e.g. the
+     * review loop) will prompt the human interactively and would otherwise
+     * receive a duplicate notification before the prompt.
+     */
+    notify?: boolean;
+  }): FoldedState {
+    const event = asEvent({
+      eventId: String(eventId()),
+      occurredAt: input.occurredAt ?? this.now(),
+      workflowId: input.workflowId,
+      ...(input.iterationId ? { iterationId: input.iterationId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
+      kind: "PlanChurnDetected",
+      payload: {
+        fromIterationId: input.fromIterationId,
+        toIterationId: input.toIterationId,
+        similarity: input.similarity,
+        detail: input.detail,
+      },
+    });
+    const state = foldReducer(this.getState(input.workflowId), event);
+    const config = this.configFor(input.workflowId);
+    this.commit(input.workflowId, state, [
+      { type: "appendEvent", event },
+      ...(input.notify === false
+        ? []
+        : [{
+            type: "notifyEscalation" as const,
+            workflowId: input.workflowId,
+            target: config.escalationNotificationTarget,
+            reason: "plan_churn",
+            openObjectionIds: openObjectionIds(state),
+          }]),
+      { type: "saveWorkflowState", workflowId: input.workflowId, status: "escalated", state, config },
+    ]);
+    return state;
+  }
+
+  /**
+   * Record a guardrail conflict: the planner reports that an objection cannot be
+   * resolved without violating a guardrail. Emits GuardrailConflict (folds to
+   * `escalated`) and notifies the human; never a silent stop. Mirrors
+   * {@link reportImplementationBlocked}.
+   */
+  reportGuardrailConflict(input: {
+    workflowId: string;
+    objectionIds: string[];
+    detail: string;
+    iterationId?: string;
+    turnId?: string;
+    agentId?: string;
+    occurredAt?: string;
+    /**
+     * Suppress the escalation notification. Use when the caller (e.g. the
+     * review loop) will prompt the human interactively and would otherwise
+     * receive a duplicate notification before the prompt.
+     */
+    notify?: boolean;
+  }): FoldedState {
+    const event = asEvent({
+      eventId: String(eventId()),
+      occurredAt: input.occurredAt ?? this.now(),
+      workflowId: input.workflowId,
+      ...(input.iterationId ? { iterationId: input.iterationId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
+      kind: "GuardrailConflict",
+      payload: { objectionIds: input.objectionIds, detail: input.detail },
+    });
+    const state = foldReducer(this.getState(input.workflowId), event);
+    const config = this.configFor(input.workflowId);
+    this.commit(input.workflowId, state, [
+      { type: "appendEvent", event },
+      ...(input.notify === false
+        ? []
+        : [{
+            type: "notifyEscalation" as const,
+            workflowId: input.workflowId,
+            target: config.escalationNotificationTarget,
+            reason: "guardrail_conflict",
+            openObjectionIds: openObjectionIds(state),
+          }]),
       { type: "saveWorkflowState", workflowId: input.workflowId, status: "escalated", state, config },
     ]);
     return state;
@@ -492,6 +630,7 @@ export class WorkflowEngine {
       ...(snapshot as Partial<FoldedState>),
       workflowId,
       seenIterationIds,
+      objections: normalizeFoldedObjections((snapshot as Partial<FoldedState>).objections),
     };
     this.states.set(workflowId, state);
     return state;

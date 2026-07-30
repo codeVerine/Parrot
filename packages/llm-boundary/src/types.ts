@@ -101,10 +101,18 @@ export type DecisionView = {
   reason: string;
 };
 
+export type CodebaseContextFile = {
+  path: string;
+  content: string;
+  bytes: number;
+  truncated: boolean;
+};
+
 export type BuildContext = {
   task?: string;
   proposalSummary?: string;
   proposalPath?: string;
+  codebaseContext?: CodebaseContextFile[];
   requirements?: RequirementView[];
   openObjections?: ObjectionView[];
   allObjections?: ObjectionView[];

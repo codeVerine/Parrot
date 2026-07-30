@@ -2,6 +2,12 @@
 
 **Version:** 0.2 (Draft)
 
+> **Design baseline, not live reference.** Phases 1-12 were derived from this
+> draft, but implementation has since added resume, codebase evidence,
+> stalemate/guardrail escalation, proposal-diff frontier re-invocation, portable
+> CLI entrypoints, and worktree-backed implementation/verification. See
+> `docs/ARCHITECTURE.md` and `docs/phases/README.md` for current state.
+
 **Changes from 0.1:** Incorporates verified Herdr 0.7.3 (protocol 16) capabilities, replaces numeric consensus with objection tracking, replaces pane reading with turn-scoped TOON result artifacts, adds durable event log, defines the turn protocol, merges the Decision Engine into the Workflow Engine, and resolves most of the v0.1 open questions.
 
 ## 1. Vision

@@ -13,6 +13,8 @@ import {
   runReviewLoop,
   selectResumeWorkflowId,
   collectResumeCandidates,
+  reuseImplementation,
+  verificationCompleted,
   ResumeTurnRegistry,
   type AgentTurnRequest,
 } from "../src/index.js";
@@ -56,7 +58,7 @@ function reply(req: AgentTurnRequest): { role: string; payload: Record<string, u
     return { role: "planner", payload: { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] } };
   }
   if (req.turnType.includes("review")) {
-    return { role: "reviewer", payload: { objections: [] } };
+    return { role: "reviewer", payload: { objections: [], cleanRationale: "All criteria satisfied." } };
   }
   return { role: "frontier", payload: { readiness: "ready", risks: [], questions: [] } };
 }
@@ -273,6 +275,88 @@ test("missing result file for waiting turn falls back to fresh turn", async () =
   assert.notEqual(result.turnId, "old-waiting");
 });
 
+test("late result on disk for a waiting turn is adopted without dispatching a replacement", async () => {
+  const store = new PersistenceStore({ path: ":memory:" });
+  seedWorkflow(store);
+  seedIteration(store, "i1");
+  const resultPath = join(tmpdir(), `resume-late-${randomUUID()}`, "result.toon");
+  mkdirSync(dirname(resultPath), { recursive: true });
+  writeFileSync(resultPath, encodeToon({
+    workflowId: "w1", iterationId: "i1", turnId: "late-t1",
+    schemaVersion: "v1", nonce: "late-nonce", role: "planner",
+    payload: { role: "planner", proposalPath: "plan.md", summary: "late planner result", objectionsAddressed: [] },
+  }), "utf8");
+  store.saveTurn(baseTurn({
+    turnId: "late-t1", nonce: "late-nonce", resultPath, state: "waiting",
+  }));
+
+  const comp = adoptComp(store, () => { throw new Error("late result must be adopted"); }, "late");
+  comp.startWorkflow({ workflowId: "w1", workspaceId: "ws1", task: "t" });
+  comp.resumeWorkflow("w1");
+
+  const result = await comp.runTurn({
+    turnType: "planner_propose",
+    workflowId: "w1",
+    iterationId: "i1",
+    agentId: "a1",
+    context: { task: "t" },
+  });
+
+  assert.equal(result.status, "valid");
+  assert.equal(result.turnId, "late-t1");
+  assert.equal(store.getTurn("late-t1")?.state, "completed");
+});
+
+test("completed implementation and verification are both reusable after interruption", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-post-review-resume-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  let counter = 0;
+  const resolver = (req: AgentTurnRequest): string => {
+    const role = req.turnType === "implementation" ? "implementation" : "resolution";
+    const payload = role === "implementation"
+      ? { status: "completed", summary: "implementation finished" }
+      : { verified: ["post-review-turn-1"], unresolved: [] };
+    const text = envelope(req, role, payload);
+    mkdirSync(dirname(req.resultPath), { recursive: true });
+    writeFileSync(req.resultPath, text, "utf8");
+    return text;
+  };
+  const comp1 = createComposition({
+    store,
+    runner: createFixtureRunner(resolver),
+    humanSink: createMemorySink(),
+    runsRoot,
+    writePrompts: false,
+    newId: () => `post-review-turn-${++counter}`,
+    nonceFactory: () => "post-review-nonce",
+  });
+  comp1.startWorkflow({ workflowId: "post-review", workspaceId: "ws1", task: "implement" });
+  const implementation = await comp1.runImplementation({
+    workflowId: "post-review",
+    iterationId: "post-review-impl",
+    agentId: "implementation",
+    task: "implement",
+  });
+  assert.equal(implementation.status, "completed");
+  if (implementation.status !== "completed") return;
+
+  const verification = await comp1.runVerification({
+    workflowId: "post-review",
+    iterationId: "post-review-impl",
+    agentId: "agent-verifier",
+    targetTurnId: implementation.turnId,
+    summary: implementation.summary,
+    evidence: [],
+  });
+  assert.equal(verification.status, "valid");
+
+  // A fresh process/resume must reuse the implementation and recognize that its
+  // already-complete verification does not need another verifier dispatch.
+  const reused = reuseImplementation(store, "post-review", "post-review-impl");
+  assert.deepEqual(reused, { turnId: implementation.turnId, summary: "implementation finished" });
+  assert.equal(verificationCompleted(store, "post-review", "post-review-impl", implementation.turnId), true);
+});
+
 test("resume adoption preserves original turn identity for completed turn", async () => {
   const store = new PersistenceStore({ path: ":memory:" });
   seedWorkflow(store);
@@ -304,6 +388,41 @@ test("resume adoption preserves original turn identity for completed turn", asyn
   assert.equal(result.status, "valid");
   assert.equal(result.turnId, "completed-t1");
   assert.equal(store.getTurn("completed-t1")?.state, "completed");
+});
+
+test("resume rehydrates a completed planner turn whose result.toon used the pre-Phase-10 bare-ID objectionsAddressed form", async () => {
+  const store = new PersistenceStore({ path: ":memory:" });
+  seedWorkflow(store);
+  seedIteration(store, "i1");
+  const resultPath = join(tmpdir(), `resume-legacy-${randomUUID()}`, "result.toon");
+  mkdirSync(dirname(resultPath), { recursive: true });
+  const text = encodeToon({
+    workflowId: "w1", iterationId: "i1", turnId: "legacy-t1",
+    schemaVersion: "v1", nonce: "n1", role: "planner",
+    // Pre-Phase-10 shape: bare objection ID strings, no evidence/strategy/guardrail fields.
+    payload: { role: "planner", proposalPath: "plan.md", summary: "s", objectionsAddressed: ["OBJ-1", "OBJ-2"] },
+  });
+  writeFileSync(resultPath, text, "utf8");
+
+  store.saveTurn(baseTurn({
+    turnId: "legacy-t1", nonce: "n1", resultPath, state: "completed",
+  }));
+
+  const comp = adoptComp(store, () => { throw new Error("should not be called"); }, "legacy");
+  comp.startWorkflow({ workflowId: "w1", workspaceId: "ws1", task: "t" });
+  comp.resumeWorkflow("w1"); // populate the resume registry
+
+  const result = await comp.runTurn({
+    turnType: "planner_propose",
+    workflowId: "w1",
+    iterationId: "i1",
+    agentId: "a1",
+    context: { task: "t" },
+  });
+  assert.equal(result.status, "valid");
+  assert.equal(result.turnId, "legacy-t1");
+  const payload = result.status === "valid" ? (result.payload as { objectionsAddressed: Array<{ objectionId: string }> }) : undefined;
+  assert.deepEqual(payload?.objectionsAddressed.map((a) => a.objectionId), ["OBJ-1", "OBJ-2"]);
 });
 
 test("startTurn rejects duplicate IDs in engine", async () => {

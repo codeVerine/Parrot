@@ -100,7 +100,7 @@ export class ResultExtractor {
       return fail("schema_invalid", validated.error.message);
     }
 
-    const evidenceIssue = checkEvidenceRules(validated.data);
+    const evidenceIssue = checkEvidenceRules(validated.data, rolePayload, input.inputObjectionIds ?? []);
     if (evidenceIssue) return fail("evidence_rules", evidenceIssue);
 
     const isMerge =
@@ -125,31 +125,61 @@ export class ResultExtractor {
   }
 }
 
-function normalizePayload(payload: Record<string, unknown>, role: string): unknown {
+function normalizePayload(payload: Record<string, unknown>, role: string): Record<string, unknown> {
   if (!("role" in payload)) {
     return { role, ...payload };
   }
   return payload;
 }
 
-function checkEvidenceRules(payload: unknown): string | null {
-  if (
-    typeof payload !== "object" ||
-    payload === null ||
-    (payload as { role?: string }).role !== "reviewer"
-  ) {
+function checkEvidenceRules(
+  payload: unknown,
+  rawPayload: Record<string, unknown>,
+  inputObjectionIds: readonly string[],
+): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const role = (payload as { role?: string }).role;
+
+  if (role === "reviewer") {
+    const reviewerPayload = payload as {
+      objections?: Array<{ id: string; evidence: string[]; evidence_missing?: boolean }>;
+      cleanRationale?: string;
+    };
+    const objections = reviewerPayload.objections;
+    if (!objections) return null;
+    for (const objection of objections) {
+      if (objection.evidence.length === 0 && objection.evidence_missing !== true) {
+        return `Objection ${objection.id} has empty evidence without evidence_missing: true`;
+      }
+    }
+    if (objections.length === 0 && !reviewerPayload.cleanRationale?.trim()) {
+      return "Reviewer returned zero objections without a cleanRationale";
+    }
     return null;
   }
-  const objections = (
-    payload as {
-      objections?: Array<{ id: string; evidence: string[]; evidence_missing?: boolean }>;
+
+  if (role === "planner") {
+    const addressed = (
+      payload as {
+        objectionsAddressed?: Array<{ objectionId: string; resolutionStrategy: string; evidence: string }>;
+      }
+    ).objectionsAddressed;
+    if (!addressed || addressed.length === 0) return null;
+    // Index into the pre-transform payload to tell a fresh structured addressal apart
+    // from a bare-ID legacy entry (same post-parse shape, but not evidence-checked - it
+    // predates this rule and must still validate on resume).
+    const rawAddressed = Array.isArray(rawPayload.objectionsAddressed) ? rawPayload.objectionsAddressed : [];
+    for (const [index, addressal] of addressed.entries()) {
+      if (typeof rawAddressed[index] === "string") continue;
+      if (addressal.resolutionStrategy === "revised_plan" && addressal.evidence.trim().length === 0) {
+        return `Objection addressal ${addressal.objectionId} has resolutionStrategy revised_plan with empty evidence`;
+      }
+      if (!inputObjectionIds.includes(addressal.objectionId)) {
+        return `Objection addressal references ${addressal.objectionId}, which is not among the turn's input objection IDs`;
+      }
     }
-  ).objections;
-  if (!objections) return null;
-  for (const objection of objections) {
-    if (objection.evidence.length === 0 && objection.evidence_missing !== true) {
-      return `Objection ${objection.id} has empty evidence without evidence_missing: true`;
-    }
+    return null;
   }
+
   return null;
 }

@@ -291,8 +291,12 @@ export async function adoptResumeCandidate(
     );
   }
 
-  // Validate the result bytes.
+  // Validate the result bytes. Skip inputObjectionIds for completed planner
+  // turns: the cross-check applies to the current set of open objections, but
+  // a completed turn addressed the objections that were open at its time.
   const resultBytesSafe = resultBytes!;
+  const skipObjectionIdCheck = candidate.state === "completed" &&
+    (turnType === "planner_propose" || turnType === "planner_revise");
   const resultVerdict = extractor.validate({
     bytes: resultBytesSafe,
     turn: {
@@ -303,7 +307,7 @@ export async function adoptResumeCandidate(
       turnType,
       attempt: candidate.attempt,
     },
-    ...(input.inputObjectionIds ? { inputObjectionIds: input.inputObjectionIds } : {}),
+    ...(input.inputObjectionIds && !skipObjectionIdCheck ? { inputObjectionIds: input.inputObjectionIds } : {}),
   });
 
   // Compute semantic validity for resolution_verification BEFORE any engine

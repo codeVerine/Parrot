@@ -1,13 +1,14 @@
 # Phase 7: Implementation Agents and MVP
 
-**Status: planned**
+**Status: implemented (packaged MVP; legacy root retirement pending)**
 
 Phase 7 closes the V2 MVP loop. After a human approves a plan, the approved
 work is routed to isolated implementation agents, their structured results and
 deviation requests are collected through the same turn protocol as review, and
-the human retains approval and audit control. It also performs the composition
-migration: the phase 1-2 era root `src/` orchestrator is retired in favor of a
-workspace package that wires the `@platform/*` stack into one runnable MVP.
+the human retains approval and audit control. The workspace composition root is
+shipped. The phase 1-2 era root `src/` implementation is still retained behind
+`pnpm orchestrate:legacy`; its deletion remains the separate parity-gated task
+in `task.md`.
 
 It depends on Phases 1 through 6. It introduces **no new platform event kinds**
 and **no new role-result schemas**: `ImplementationResultSchema` and the
@@ -35,8 +36,9 @@ Packages consume:
 **Goal.** Two deliverables that finish the MVP:
 
 1. **Composition root** - one workspace package that owns the end-to-end run,
-   wiring engine, LLM boundary, human loop, and runtime adapter. Replaces the
-   parallel legacy stack in root `src/`.
+   wiring engine, LLM boundary, human loop, and runtime adapter. It is the
+   current implementation; the parallel root stack remains compatibility-only
+   until its retirement gate is satisfied.
 2. **Implementation agents** - route an approved plan to isolated agents, drive
    the implementation turn, collect `ImplementationResult` (completed or
    blocked) and deviation requests, and hand control back to the human with
@@ -52,33 +54,34 @@ Packages consume:
 
 ## 2. Composition Root Migration
 
-source: repo shape decision; this phase owns the retirement of legacy `src/`
+source: repo shape decision; package migration shipped, deletion still gated
 
 ### 2.1 Direction
 
-Root `src/` is a phase 1-2 era orchestrator with its own duplicate schemas
+Root `src/` remains a phase 1-2 era orchestrator with its own duplicate schemas
 (`src/schemas.ts`), its own Herdr shim (`src/herdr.ts`), its own human gate
 (`src/gate.ts`), and its own prompt assembly (`src/prompts.ts`). Six of its
 seven files are reimplementations of what the `@platform/*` packages now own,
 and `orchestrate.ts` imports only its own modules plus `@platform/contracts`.
-It is a parallel stack, not a partial one.
+It is a parallel compatibility stack, not a partial package.
 
-The MVP composition lands in a new workspace package,
-**`@platform/orchestrator`** under `packages/orchestrator`, built against the
-real seams. Legacy `src/` is deleted once the new package reaches loop parity.
-Keeping `src/` would preserve a second source of truth (the same reason
-`src/toon.ts` was deleted earlier); a package also joins the uniform
-`pnpm -r` build / typecheck / test graph instead of the root-only special case.
+The MVP composition lives in **`@platform/orchestrator`** under
+`packages/orchestrator`, built against the real seams. The root `orchestrate`
+and `parrot` scripts select that package. Legacy `src/` is deleted only after
+the live parity gate in `task.md`; until then, the root typecheck and explicit
+`orchestrate:legacy` command keep its compatibility path honest.
 
 ### 2.2 Migrate-then-delete sequencing
 
-`src/` is currently the only runnable end-to-end MVP. It is not deleted first.
+The package is the current runnable end-to-end MVP. Retirement sequencing is:
 
-1. Build `packages/orchestrator` composition against `@platform/*` and reach
-   loop parity (plan -> review -> merge -> gate -> frontier -> human -> approve).
-2. Move the run entrypoint (`pnpm orchestrate`) to the orchestrator package.
-3. Delete root `src/` and drop the root-only `tsc --noEmit` special case from
-   the `typecheck` script once every source file lives in a workspace package.
+1. Build `packages/orchestrator` against `@platform/*` and cover the packaged
+   loop with deterministic tests. **Done.**
+2. Move `pnpm orchestrate` to the package and add the `parrot` development and
+   compiled bin entrypoints. **Done.**
+3. Confirm live Herdr loop parity, then delete root `src/`, remove
+   `orchestrate:legacy`, and drop the root-only typecheck/dependencies.
+   **Pending approval.**
 
 ### 2.3 Salvage before delete
 
@@ -105,11 +108,11 @@ The implementation workflow starts on `HumanApproved` for a plan (Phase 4
 
 ### 3.2 Isolation
 
-Each implementation agent runs in an isolated worktree so concurrent or retried
-work cannot corrupt a shared tree. The platform stores a **reference** to the
-worktree (path plus content identity), consistent with the Phase 6 transcript
-policy: the platform owns references and hashes, not copies. Worktree lifecycle
-and cleanup are an assigned open question (section 9).
+Implementation and verification run in the same workflow-specific isolated git
+worktree so the verifier checks the files the implementation role changed. Its
+directory and branch include a stable hash of the raw workflow ID, preventing
+collisions after sanitization. Reuse validates repository and branch ownership.
+Worktree cleanup remains manual and is an assigned open question (section 8).
 
 ### 3.3 Turn mechanics
 
@@ -154,6 +157,8 @@ Completed implementation results are verified through the existing
 claimed completion is checked rather than trusted. Verification failure follows
 the same bounded-repair-then-escalate path as any other turn. Verification is
 structured (result files remain the canonical contract), never a prose read.
+The verifier runs in the implementation worktree and receives its git branch,
+HEAD, porcelain status, changed-file list, and diff statistics as evidence.
 
 ## 5. Human Approval and Audit
 
@@ -175,26 +180,28 @@ The human end reuses Phase 6 with no new surfaces:
 
 | Key | Type | Default | Consuming section |
 |---|---|---|---|
-| `implementationRolePromptPin` | `{ id, version }` | Phase 5 implementation pin | §3.3 |
-| `implementationProviderModel` | `{ provider, model }` | Phase 5 stub | §3.3 |
-| `worktreeRoot` | path | repo-local isolated root | §3.2 |
-| `worktreeCleanupPolicy` | `"on_success" \| "on_approval" \| "manual"` | assigned question | §3.2, §9 |
-| `implementationRepairBound` | positive int | Phase 5 repair bound | §3.3 |
-| `deviationRequiresHuman` | boolean | `true` | §3.4 |
-| `providerImplementationLimits` | map | assigned question | §9 |
+| `DEFAULT_LLM_BOUNDARY_CONFIG.rolePromptPins.implementation` | `{ id, version }` | `implementation@1.0.0` | §3.3 |
+| `PARROT_IMPL_PROVIDER` | provider id | `claude` | §3.3 |
+| `PARROT_VERIFIER_PROVIDER` | provider id | `codex` | §4 |
+| `PARROT_WORKTREE_ROOT` | path | sibling `.parrot-worktrees/<repo>` | §3.2 |
+| `worktreeCleanupPolicy` | `"manual"` | assigned question | §3.2, §8 |
+| repair bound | fixed policy | one repair | §3.3 |
+| deviation authorization | fixed policy | human required | §3.4 |
+| `providerImplementationLimits` | not implemented | assigned question | §8 |
 
 ## 7. Test Plan
 
 - **Composition:** orchestrator drives a full loop against fixtures with no live
-  model; `src/` deletion leaves the run entrypoint working; whole-repo
-  `pnpm -r` build and typecheck stay green with no root-only special case.
+  model; root and global entrypoints resolve to the package; the retained legacy
+  source remains covered by the root typecheck until retirement.
 - **Implementation:** approved plan spawns an isolated agent; completed result
   round-trips `ImplementationResultSchema`; blocked result emits
   `ImplementationBlocked` and escalates; deviation request routes to
   `humanDecision` and does not self-authorize; deadline and reconciliation
   fixtures exercise the Phase 2 adapter paths.
 - **Verification:** completed implementation runs `resolution_verification`;
-  verification failure triggers bounded repair then escalation.
+  verification failure triggers bounded repair then escalation; CLI tests pin
+  the shared implementation/verifier worktree and its git evidence.
 - **Approval and audit:** approval posts the right events; dashboard drill-down
   resolves implementation artifact and worktree references against the seeded
   DB; notifications fire per kind.
@@ -207,7 +214,8 @@ The human end reuses Phase 6 with no new surfaces:
 
 - **Worktree cleanup (V2):** when to reclaim an isolated worktree
   (`on_success`, `on_approval`, or `manual`). Conservative default keeps the
-  worktree until human approval so a blocked or deviating run stays auditable.
+  worktree indefinitely until an operator removes it, so a blocked or deviating
+  run stays auditable.
 - **Provider-specific implementation limits (V2):** per-provider constraints on
   implementation agents (context, tool access, concurrency) captured in
   `providerImplementationLimits`; pinned at deploy, not inferred at runtime.
@@ -228,8 +236,9 @@ The human end reuses Phase 6 with no new surfaces:
 
 **Provides.**
 
-- The complete V2 section 13 MVP loop: plan -> review -> gate -> human ->
-  implement -> verify -> approve, run from a single composition root.
+- The complete packaged MVP loop: plan -> review -> gate -> human -> implement
+  -> verify, run from one workspace composition root.
 
 Completes the MVP. After this phase the platform runs end to end from a task to
-an approved, verified implementation with full cost, health, and audit coverage.
+an approved, verified implementation. Legacy root retirement and automatic
+worktree cleanup remain operational follow-ups, not missing package behavior.

@@ -1,5 +1,11 @@
 # Task: Retire the legacy root `src/` orchestrator (phase 7 §2 migrate-then-delete)
 
+> **Status (2026-07-30): pending live parity approval.** The packaged
+> `@platform/orchestrator` runtime and `parrot` entrypoints are implemented, but
+> root `src/`, its root typecheck, and `orchestrate:legacy` are still present.
+> This file is an open retirement specification, not a description of current
+> repository state.
+
 ## Context
 
 Parrot V2 is implemented across phases 1 through 7. The end-to-end MVP now lives
@@ -16,7 +22,7 @@ the new package reaches loop parity. This task performs that retirement.
 ## Precondition (approval gate)
 
 Do **not** treat this task as ready to merge until loop parity is confirmed:
-`pnpm orchestrate:next <task>` drives the full loop (plan -> review -> merge ->
+`pnpm orchestrate <task>` drives the full loop (plan -> review -> merge ->
 gate -> frontier -> human -> approve) against a live Herdr daemon. Parity is the
 human's assertion at the approval step. If parity is not yet confirmed, stop and
 escalate rather than deleting `src/`.
@@ -40,7 +46,7 @@ uniform `pnpm -r` build / typecheck / test graph.
 2. **Move the run entrypoint to the package.** In root `package.json`:
    - Point `orchestrate` at the package:
      `"orchestrate": "pnpm --filter @platform/orchestrator orchestrate"`.
-   - Remove the now-redundant `orchestrate:next` script.
+   - Keep the already-migrated `orchestrate` package entrypoint.
 
 3. **Delete the legacy stack.** Remove the entire root `src/` directory
    (`gate.ts`, `herdr.ts`, `orchestrate.ts`, `prompts.ts`, `registry.ts`,
@@ -57,17 +63,11 @@ uniform `pnpm -r` build / typecheck / test graph.
    used solely by the deleted entrypoint (`tsx`). Keep only what the workspace
    root still needs. Verify by a clean install plus full build.
 
-6. **Update documentation to the package entrypoint and implemented status.**
-   - `docs/phases/README.md`: flip the phase 7 row status from `skeleton` to
-     `implemented`.
-   - `docs/phases/phase-7-implementation-agents-and-mvp.md`: change
-     `**Status: planned**` to `**Status: implemented**`.
-   - `README.md`: replace every `pnpm exec tsx src/orchestrate.ts ...` and
-     `tsx src/orchestrate.ts` usage example with the `pnpm orchestrate ...`
-     package entrypoint; update the "What Is Implemented" / "What Is Not
-     Implemented Yet" sections so phase 7 (implementation agents + composition
-     root) is listed as implemented; and update the `src/` file-tree section to
-     describe `packages/orchestrator` instead of the deleted `src/`.
+6. **Update documentation after deletion.**
+   - Remove the compatibility caveats from `README.md`,
+     `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`, the phase map, and this task.
+   - Remove `orchestrate:legacy` from the documented command surface.
+   - Record the live Herdr parity evidence that authorized deletion.
 
 ## Acceptance criteria
 
@@ -77,10 +77,9 @@ uniform `pnpm -r` build / typecheck / test graph.
   pass with the legacy stack gone.
 - `pnpm orchestrate <task>` resolves to and runs the `@platform/orchestrator`
   package (socket auto-discovered, workspace auto-resolved).
-- No dangling references to `src/orchestrate.ts` or `orchestrate:next` remain in
+- No dangling references to `src/orchestrate.ts` or `orchestrate:legacy` remain in
   scripts or docs.
-- Phase 7 is marked `implemented` in both `docs/phases/README.md` and the
-  phase-7 document.
+- Current documentation no longer describes root `src/` as available.
 
 ## Guardrails
 

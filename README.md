@@ -1,464 +1,271 @@
 # Parrot
 
-Parrot is a bare-bones plan/review orchestrator for two manually started
-AI agents in Herdr:
+Parrot is a TypeScript multi-agent orchestration runtime built on
+[Herdr](https://herdr.dev/). It coordinates a durable
+plan → review → frontier → human approval → implementation → verification
+workflow while keeping state and evidence outside the model sessions.
 
-- `planner`: Claude Code
-- `reviewer`: Codex
+The current packaged runtime lives in `packages/orchestrator`. It supports:
 
-The MVP replaces manual copy/paste between the two panes. It sends each
-agent a short instruction pointing to a prompt file, waits for a
-turn-scoped `result.toon`, tracks objections, and keeps the
-planner-reviewer loop moving until consensus or the iteration cap.
+- schema-validated TOON results with one bounded repair attempt;
+- a SQLite event log, replay, and interrupted-workflow resume;
+- planner, reviewer, frontier, implementation, and verifier roles;
+- objection stalemate and guardrail-conflict escalation;
+- frontier re-review after a materially restructured proposal;
+- bounded, injection-delimited codebase context;
+- workflow-scoped provider sessions with supported session reattachment;
+- a shared isolated git worktree for implementation and verification; and
+- concise per-turn progress in the operator terminal.
 
-The full architecture is described in
-`Multi-Agent-Orchestration-Architecture-v0.2.md`. This implementation is
-only the file-backed MVP from the local plan.
-
-## What Is Implemented
-
-- TypeScript CLI launched with `tsx`.
-- Herdr CLI integration through `child_process`.
-- Strict pane resolution for exactly one `planner` and one `reviewer`.
-- Prompt files for planner and reviewer turns.
-- Turn identity with `{ runId, iteration, role, turnId }`.
-- Result validation with Zod.
-- Freshness checks so stale `result.toon` files are rejected.
-- One repair prompt after invalid TOON.
-- Append-only objection registry in `runs/<runId>/state.toon`.
-- Atomic state writes using `state.tmp` then rename.
-- Human gate only after consensus or the iteration cap.
-- Approved plans copied to `approved-plans/<task-slug>-<runId>/`.
-- Herdr notification when a round completes.
-- Reusable `@platform/persistence` package with SQLite WAL storage, an
-  append-only event log, transactional outbox dispatch, recovery, and replay.
-- Reusable `@platform/workflow-engine` package with deterministic turn and
-  planning reducers, pure guards, usage/budget fold, orphan handling, and
-  persistence-backed recovery.
-- Reusable `@platform/llm-boundary` package with prompt builder, TOON
-  extraction/validation, bounded repair verdicts, injection-safe evidence
-  quoting, and non-destructive objection merge post-processing.
-- Reusable `@platform/human-loop` package with frontier finding conversion,
-  panel contradiction detection, dashboard read-model projections,
-  human notification sinks, versioned session-log cost adapters, and
-  transcript redaction.
-- `@platform/dashboard` React + Vite UI over the human-loop decision API.
-
-## What Is Not Implemented Yet
-
-- The bootstrap CLI has not yet migrated its file-backed state to the new
-  persistence package.
-- Dashboard.
-- Frontier review.
-- Worktree orchestration.
-- Cost ledger.
-- Herdr socket API client.
-- Provider session log parsing.
-- Automatic agent startup.
+Plan-churn detection is deliberately deferred: its compatibility configuration
+is accepted but ignored until a real-corpus heuristic is reliable. See
+[Phase 12](docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md).
 
 ## Requirements
 
-- Node.js installed.
-- Herdr installed and running.
-- Claude Code and Codex available in Herdr panes.
-- Project dependencies installed with `pnpm install`.
+- Node.js `22.13.0` through 22.x, or `23.4.0` and newer. The Nix development
+  shell currently provides Node.js 24.
+- pnpm `10.13.1`, as pinned by `packageManager` in `package.json`.
+- git.
+- Herdr with protocol 16 and working provider integrations.
+- At least the `claude` and `codex` CLIs for the default role mapping.
 
-The local implementation was validated against Herdr `0.7.3` protocol
-`16`.
+If you use Nix:
+
+```bash
+nix develop
+```
+
+Otherwise, enable the pnpm version pinned by the repository:
+
+```bash
+corepack enable
+corepack use pnpm@10.13.1
+```
 
 ## Install
 
-From the repo root:
-
 ```bash
 pnpm install
+pnpm build
 ```
 
-Validate TypeScript:
+## Run from this repository
+
+Start Herdr in one terminal:
 
 ```bash
-pnpm typecheck
+herdr
 ```
 
-## Prepare Herdr Panes
-
-Start Herdr and open two panes manually:
-
-1. In one pane, start Claude Code.
-2. In another pane, start Codex.
-3. Rename exactly one pane to `planner`.
-4. Rename exactly one pane to `reviewer`.
-
-Use:
+Then run Parrot from the target git repository. During development, this
+repository itself is the target:
 
 ```bash
-herdr agent rename <target> planner
-herdr agent rename <target> reviewer
+pnpm parrot task.md
 ```
 
-`<target>` can be a terminal ID, unique agent name, detected/reported
-agent label, or pane ID accepted by Herdr.
-
-To inspect current agents:
+A task can be one or more existing file paths, inline text arguments, or a mix
+of both. Existing files are read relative to the directory where the command
+was invoked.
 
 ```bash
-herdr agent list
+pnpm parrot task.md "Also verify resume safety."
 ```
 
-The orchestrator intentionally fails if either role resolves to zero or
-multiple agents. The error prints current candidates and the rename
-command to use.
+The CLI requires an interactive terminal for the escalation and final
+approve/reject prompts.
 
-## Provide Task Input
+## Install the global command
 
-Parrot accepts task input as an inline prompt, a readable file, or both.
-
-Inline prompt:
+The global wrapper executes the compiled orchestrator, so build before linking:
 
 ```bash
-pnpm orchestrate "Design the SQLite persistence layer for Parrot."
+pnpm --filter @platform/orchestrator build
+pnpm --filter @platform/orchestrator link --global
+parrot --help
 ```
 
-Task file:
-
-Example:
+You can then invoke Parrot from any target git repository:
 
 ```bash
-cat > task.md <<'EOF'
-Design the SQLite persistence layer for Parrot based on section 6.9 of
-Multi-Agent-Orchestration-Architecture-v0.2.md.
-EOF
+cd /path/to/target/repository
+parrot task.md
 ```
+
+To use a target directory without changing directories:
 
 ```bash
-pnpm orchestrate task.md
+PARROT_PROJECT_DIR=/path/to/target/repository parrot /path/to/task.md
 ```
 
-Task file plus additional prompt:
+## Resume a workflow
+
+Resume the newest non-terminal workflow:
 
 ```bash
-pnpm orchestrate task.md "Also account for migration from the current TOON state files."
+parrot --resume
 ```
 
-When both are provided, Parrot combines the file content and inline
-prompt before sending the planner turn.
-
-## Run
+Resume a specific workflow:
 
 ```bash
-pnpm exec tsx src/orchestrate.ts "Design the SQLite persistence layer for Parrot."
+parrot --resume wf-123
 ```
 
-Or through the package script:
+The equivalent environment variable forms are:
 
 ```bash
-pnpm orchestrate task.md "Also account for migration from the current TOON state files."
+PARROT_RESUME=1 parrot
+PARROT_RESUME=wf-123 parrot
 ```
 
-The orchestrator will:
+Resume folds the stored event log, restores persisted objections and proposal
+state, adopts a completed late result only after identity and semantic
+validation, and reattaches provider sessions when their installed CLI exposes a
+documented session-id option.
 
-1. Check `herdr status`.
-2. Resolve `planner` and `reviewer` panes.
-3. Create a new run directory under `runs/`.
-4. Write the planner prompt.
-5. Send a one-line instruction to the planner pane.
-6. Wait for the planner `result.toon`.
-7. Write the reviewer prompt.
-8. Send a one-line instruction to the reviewer pane.
-9. Wait for the reviewer `result.toon`.
-10. Update the objection registry.
-11. Print a round summary and artifact paths.
-12. Continue automatically if open objections remain and the iteration cap
-    has not been reached.
-13. Ask the human what to do next only after consensus or the iteration
-    cap.
+## Runtime files
 
-## Human Gate
-
-Parrot does not ask for human intervention while the reviewer and planner
-still have open objections to work through and iteration budget remains.
-It asks only when consensus is reached or when the configured iteration
-cap is reached.
-
-If open objections remain before the cap, Parrot continues automatically:
+By default, Parrot writes target-project state under `runs/`:
 
 ```text
-Open objections remain (2: 0 blocking, 2 major, 0 minor). Continuing automatically.
+runs/
+├── parrot.db
+└── <workflow-id>/
+    └── <iteration-id>/
+        └── <turn-id>/
+            ├── prompt.md
+            ├── result.toon
+            └── proposal.md       # planner turns
 ```
 
-If the iteration cap is reached with open objections:
+`runs/` is ignored by git. The SQLite database is the durable source of truth;
+prompt, result, proposal, transcript, and session-log paths are persisted as
+audit evidence.
+
+Create a review bundle from the newest workflow:
+
+```bash
+node scripts/bundle-review.mjs
+```
+
+Select a project/runs/database path and workflow explicitly:
+
+```bash
+node scripts/bundle-review.mjs /path/to/project wf-123
+```
+
+## Implementation worktrees
+
+The implementation and verifier roles use the same workflow-specific git
+worktree. The verifier receives the worktree path, branch, commit, status, and
+diff summary, so it checks the files the implementation agent actually changed.
+
+The default location is outside the target checkout:
 
 ```text
-Iteration cap reached with open objections. [c]ontinue one more round / [m]essage planner and continue / [a]pprove anyway / [q]uit:
+../.parrot-worktrees/<repo>/<sanitized-workflow-id>-<stable-hash>/
 ```
 
-If no open objections remain:
+The branch is:
 
 ```text
-Consensus reached. [a]pprove / [c]ontinue another round / [m]essage planner / [q]uit:
+parrot/<sanitized-workflow-id>-<stable-hash>
 ```
 
-If an agent times out:
-
-```text
-Agent timed out. [r]etry / [q]uit:
-```
-
-Consensus never auto-exits. Human approval is still required. Approval
-with open objections is only offered after the iteration cap is reached,
-and the prompt labels that path as approval anyway instead of consensus.
-
-At either intervention point, choosing `m` lets the human enter
-additional instructions for the planner, such as extra context, files to
-inspect, or constraints to consider. Parrot records that message and
-includes it in the next planner turn under `Additional Human Messages`.
-
-## Runtime Artifacts
-
-Runs are created under:
-
-```text
-runs/<runId>/
-```
-
-Each iteration writes:
-
-```text
-runs/<runId>/iter-<n>/planner/
-  prompt.md
-  plan.md
-  result.toon
-  repair-prompt.md    # only if repair was needed
-
-runs/<runId>/iter-<n>/reviewer/
-  prompt.md
-  result.toon
-  repair-prompt.md    # only if repair was needed
-
-runs/<runId>/state.toon
-```
-
-`runs/` is gitignored.
-
-When a human approves a plan, Parrot also copies it to:
-
-```text
-approved-plans/<task-slug>-<runId>/
-  plan-<summary-slug>.md
-  approval.toon
-```
-
-`approval.toon` records the run id, approved iteration, approval time,
-internal source plan path, and open objection counts at approval time.
-
-The planner's working plan remains in the run folder for the approved
-iteration. The approved plan is a separate copy intended for review and
-handoff:
-
-```text
-runs/<runId>/iter-<n>/planner/plan.md                    # planner's turn output
-approved-plans/<task-slug>-<runId>/plan-<summary-slug>.md # final approved copy
-```
-
-After every reviewer turn, Parrot prints the current planner plan,
-planner result, reviewer result, and run state paths before asking for a
-human decision. After approval, it prints the final plan path, approval
-metadata path, source planner plan path, and run artifact directory.
-
-Parrot uses TOON for local workflow artifacts wherever possible. JSON is
-kept only for external contracts that require it, such as Herdr CLI
-responses.
-
-## Result Contract
-
-Every LLM result is written as TOON and must include this envelope:
-
-```toon
-runId: 20260717-1432-x7k2
-iteration: 1
-role: planner
-turnId: abc123
-payload:
-```
-
-The envelope is checked before the payload. A result is rejected if:
-
-- `runId` does not match the active run.
-- `iteration` does not match the active iteration.
-- `role` is not the expected role.
-- `turnId` does not match the active turn.
-- The file is older than the send time.
-- The TOON document does not match the role schema.
-
-Agents are instructed to write `result.tmp` first, then rename it to
-`result.toon`.
-
-## Planner Payload
-
-Planner results must match:
-
-```ts
-{
-  planPath: string;
-  summary: string;
-  addressedObjections: Array<{
-    id: string;
-    response: string;
-    evidence: string[];
-  }>;
-}
-```
-
-The full plan should be written to `plan.md`. Every open objection sent
-to the planner must appear in `addressedObjections` before the reviewer
-turn runs.
-
-## Reviewer Payload
-
-Reviewer results must match:
-
-```ts
-{
-  priorObjectionStatuses: Array<{
-    id: string;
-    status: "open" | "resolved";
-    rationale: string;
-  }>;
-  newObjections: Array<{
-    severity: "blocking" | "major" | "minor";
-    claim: string;
-    evidence: string[];
-  }>;
-}
-```
-
-The reviewer cannot delete, rename, or downgrade prior objections. The
-orchestrator maintains the registry and derives current status.
-
-## Objection Registry
-
-`state.toon` stores:
-
-- immutable objection records
-- status transition records
-- resolved Herdr pane IDs
-- current iteration
-
-Objection records are never edited in place. Status is derived from the
-last transition for each objection.
+The stable hash prevents workflow IDs such as `wf/a` and `wf_a` from colliding.
+Before reuse, Parrot verifies that the directory belongs to the expected
+repository and is on the expected branch. Worktrees are not removed
+automatically.
 
 ## Configuration
 
-Environment variables:
+The CLI reads configuration from environment variables:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `PARROT_PROJECT_DIR` | Target git repository and base for relative paths | invocation directory (`INIT_CWD`, then `cwd`) |
+| `PARROT_RUNS_ROOT` | Workflow artifact directory, relative to the target unless absolute | `runs` |
+| `PARROT_DB` | SQLite database path | `<runs-root>/parrot.db` |
+| `PARROT_WORKFLOW` | Workflow ID for a fresh run | `wf-<timestamp>` |
+| `PARROT_RESUME` | Resume newest workflow (`1`, `true`, `auto`, `yes`, `on`) or the named ID | unset |
+| `PARROT_WORKSPACE` | Herdr workspace ID | focused workspace |
+| `PARROT_TAB` | Reuse an existing Herdr tab | create `parrot agents` tab |
+| `PARROT_WORKTREE_ROOT` | Worktree parent, relative to target unless absolute | sibling `.parrot-worktrees/<repo>` |
+| `PARROT_PLANNER_PROVIDER` | Planner provider | `claude` |
+| `PARROT_REVIEWER_PROVIDER` | Reviewer provider | `codex` |
+| `PARROT_FRONTIER_PROVIDER` | Frontier provider | `claude` |
+| `PARROT_IMPL_PROVIDER` | Implementation provider | `claude` |
+| `PARROT_VERIFIER_PROVIDER` | Verifier provider | `codex` |
+| `PARROT_CONTEXT_DISABLE` | Set to `1` to omit codebase context | unset |
+| `PARROT_CONTEXT_MAX_FILES` | Maximum injected files | resolver default (`12`) |
+| `PARROT_CONTEXT_MAX_BYTES` | Maximum total injected bytes | resolver default (`49152`) |
+| `PARROT_TURN_IDLE_TIMEOUT_MS` | Idle timeout, reset by agent activity | runner default |
+| `PARROT_TURN_MAX_MS` | Absolute turn deadline | runner default |
+| `PARROT_TURN_TIMEOUT_MS` | Deprecated absolute-deadline alias | unset |
+| `HERDR_BIN` | Herdr executable | `herdr` |
+| `HERDR_SOCKET` | Explicit daemon socket path | discovered socket, then default socket |
+
+Invalid context-limit values are ignored. `PARROT_TURN_MAX_MS` takes precedence
+over the deprecated `PARROT_TURN_TIMEOUT_MS`.
+
+The library packages expose additional typed configuration objects. See
+[Configuration](docs/CONFIGURATION.md).
+
+## Development commands
+
+Run these from the repository root:
 
 ```bash
-PARROT_MAX_ITERATIONS=5
-PARROT_TURN_TIMEOUT_MS=900000
-```
-
-Defaults:
-
-- `PARROT_MAX_ITERATIONS`: `5`
-- `PARROT_TURN_TIMEOUT_MS`: `900000` milliseconds, or 15 minutes
-
-Example:
-
-```bash
-PARROT_MAX_ITERATIONS=3 PARROT_TURN_TIMEOUT_MS=300000 pnpm exec tsx src/orchestrate.ts task.md
-```
-
-## Validation Commands
-
-Typecheck:
-
-```bash
+pnpm build
 pnpm typecheck
+pnpm test
 ```
 
-CLI usage check:
+Useful focused commands:
 
 ```bash
-pnpm exec tsx src/orchestrate.ts
+pnpm --filter @platform/orchestrator test
+pnpm --filter @platform/workflow-engine test
+pnpm --filter @platform/dashboard dev
+pnpm --filter @platform/dashboard build
 ```
 
-Expected output:
+The dashboard development server listens on `127.0.0.1:5173` and proxies
+`/api` to `127.0.0.1:8787`. The HTTP API is a library surface
+(`createDashboardApi`); the main CLI does not start it automatically.
+
+See [Getting Started](docs/GETTING-STARTED.md),
+[Development](docs/DEVELOPMENT.md), and [Testing](docs/TESTING.md) for the
+complete workflows.
+
+## Repository map
 
 ```text
-Usage: pnpm exec tsx src/orchestrate.ts <prompt text | task.md> [more prompt text]
+packages/
+├── contracts/          shared IDs, events, signals, TOON, and role schemas
+├── herdr-adapter/      protocol-16 runtime adapter and reliable turn delivery
+├── persistence/        SQLite store, schema, event fold, outbox, and recovery
+├── workflow-engine/    deterministic planning state machine and guards
+├── llm-boundary/       prompt construction, extraction, validation, objections
+├── human-loop/         frontier conversion, notifications, dashboard, cost
+├── orchestrator/       CLI composition, review loop, resume, worktrees
+└── dashboard/          React/Vite dashboard client
 ```
 
-Preflight check:
+The root `src/` directory is the pre-package compatibility implementation. It is
+still runnable with `pnpm orchestrate:legacy`, but new work belongs in the
+workspace packages. Its retirement remains a separate gated task in `task.md`.
 
-```bash
-pnpm exec tsx src/orchestrate.ts task.md
-```
+## Documentation
 
-If panes are not renamed correctly, it should fail before sending any
-agent instruction and print current Herdr candidates.
+- [Documentation index](docs/README.md)
+- [Current architecture](docs/ARCHITECTURE.md)
+- [Phase implementation map](docs/phases/README.md)
+- [Architecture v0.2](Multi-Agent-Orchestration-Architecture-v0.2.md), the
+  historical design baseline
+- `approved-plans/`, immutable planning evidence retained for audit
 
-## Troubleshooting
-
-### `Expected exactly one Herdr agent named "planner"`
-
-No pane, or more than one pane, resolves to `planner`.
-
-Run:
-
-```bash
-herdr agent list
-```
-
-Then rename exactly one intended pane:
-
-```bash
-herdr agent rename <target> planner
-```
-
-Do the same for `reviewer`.
-
-### The Agent Does Not Submit The Prompt
-
-Parrot sends text with:
-
-```text
-herdr pane run <pane> <text>
-```
-
-This is required because `herdr agent send` writes literal text without
-submitting it to the TUI. `pane run` sends the instruction and submits it
-with Enter.
-
-### Invalid `result.toon`
-
-Parrot sends one repair prompt with a new `turnId`. If the second result
-is invalid, the turn fails and the CLI exits or asks for retry depending
-on where the failure occurred.
-
-### Stale Result Rejected
-
-This is expected. Before each turn, Parrot removes any existing
-`result.toon` and records the send time. A result must be newer than that
-send time and must carry the active `turnId`.
-
-## Source Layout
-
-```text
-src/
-  gate.ts          terminal human gate
-  herdr.ts         Herdr CLI wrapper and pane resolution
-  orchestrate.ts   main loop
-  prompts.ts       planner, reviewer, and repair prompt builders
-  registry.ts      append-only objection registry and state writes
-  schemas.ts       Zod schemas and TypeScript types
-  waitResult.ts    result watching, freshness, and identity checks
-
-packages/contracts/
-  src/toon/         canonical TOON encoder/decoder shared by the platform
-```
-
-## Current Development Notes
-
-- The repo has been initialized with git, but no commit has been made.
-- `node_modules/`, `runs/`, and `dist/` are ignored.
-- The implementation is intentionally small and file-backed so it can be
-  dogfooded before adding the full durable architecture.
+Parrot is currently a private `0.1.0` workspace and does not publish packages to
+a registry.

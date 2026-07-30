@@ -2,6 +2,10 @@
 
 **Version:** 0.1 (Draft)
 
+> **Historical document.** Superseded by architecture v0.2 and retained for
+> decision history. It does not describe the current command, package, event, or
+> persistence surfaces. See `docs/ARCHITECTURE.md` for the live architecture.
+
 ## 1. Vision
 
 This document describes an architecture for a multi-agent software

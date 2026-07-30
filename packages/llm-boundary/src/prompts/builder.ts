@@ -7,6 +7,7 @@ import { newNonce, sha256Hex } from "../hash.js";
 import type {
   BuildContext,
   BuiltPrompt,
+  CodebaseContextFile,
   LlmBoundaryConfig,
   ObjectionView,
   TurnIdentity,
@@ -211,6 +212,9 @@ function renderPrompt(args: {
   if (context.task) {
     lines.push("## Task", context.task, "");
   }
+  if (context.codebaseContext?.length) {
+    lines.push(...renderCodebaseContext(sentinel, context.codebaseContext, collectUntrusted));
+  }
   if (context.proposalPath) {
     lines.push(`## Proposal path`, context.proposalPath, "");
   }
@@ -337,6 +341,27 @@ function renderObjectionEvidence(
   return lines;
 }
 
+function renderCodebaseContext(
+  sentinel: string,
+  files: CodebaseContextFile[],
+  collectUntrusted: (value: string) => void,
+): string[] {
+  const lines = ["## Codebase Context"];
+  for (const file of files) {
+    collectUntrusted(file.content);
+    const emittedBytes = Buffer.byteLength(file.content, "utf8");
+    const omittedBytes = Math.max(0, file.bytes - emittedBytes);
+    lines.push(`### ${file.path}`);
+    lines.push(`bytes: ${file.bytes}`);
+    if (file.truncated) {
+      lines.push(`truncated: true (${omittedBytes} bytes omitted)`);
+    }
+    lines.push(evidenceBlock(sentinel, file.path, "content", file.content));
+    lines.push("");
+  }
+  return lines;
+}
+
 function titleFor(turnType: TurnType): string {
   return turnType
     .split("_")
@@ -363,7 +388,14 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
           role: "planner",
           proposalPath: "path/to/proposal.md",
           summary: "Short summary.",
-          objectionsAddressed: [],
+          objectionsAddressed: [
+            {
+              objectionId: "OBJ-1",
+              resolutionStrategy: "revised_plan",
+              evidence: "Exact quote from proposal.md or pasted code.",
+              requiresGuardrailException: false,
+            },
+          ],
         },
       };
     case "reviewer_review":
@@ -371,7 +403,7 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
       return {
         ...base,
         role: "reviewer",
-        payload: { role: "reviewer", objections: [] },
+        payload: { role: "reviewer", objections: [], cleanRationale: "The plan satisfies criterion X because ... and guardrail Y because ..." },
       };
     case "resolution_verification":
       return {

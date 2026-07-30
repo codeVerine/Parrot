@@ -5,8 +5,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { agentId, turnId } from "@platform/contracts";
-import { HerdrAgentRuntime } from "../src/runtime.js";
+import { composeProviderReattachArgv, HerdrAgentRuntime } from "../src/runtime.js";
 import { FakeHerdr } from "./fake-herdr.js";
+
+test("provider reattach argv uses documented session-id forms", () => {
+  assert.deepEqual(composeProviderReattachArgv("claude", ["claude"], { sessionId: "claude-session" }), [
+    "claude", "--resume", "claude-session",
+  ]);
+  assert.deepEqual(composeProviderReattachArgv("codex", ["codex"], { sessionId: "codex-session" }), [
+    "codex", "resume", "codex-session",
+  ]);
+  // Session paths are persisted for identity/reconciliation, but neither
+  // installed CLI documents a path argument, so do not invent one.
+  assert.deepEqual(composeProviderReattachArgv("claude", ["claude"], { sessionPath: "/tmp/session" }), ["claude"]);
+  assert.deepEqual(composeProviderReattachArgv("gemini", ["gemini"], { sessionId: "gemini-session" }), ["gemini"]);
+});
 
 test("runtime correlates delivery, result hash, and result-file signal", async () => {
   const fake = new FakeHerdr(); const runtime = new HerdrAgentRuntime({ client: fake, config: { turnDeadlineMs: 500, operationTimeoutMs: 100, pollIntervalMs: 5 } });

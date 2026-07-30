@@ -49,6 +49,11 @@ export type Composition = {
   engine: WorkflowEngine;
   store: PersistenceStore;
   humanSink: HumanNotificationSink;
+  /** Resolved human-loop config (with defaults). The loop uses the configured
+   * dashboard base for the escalation notifications it re-emits after a
+   * suppressed engine notify, so the deep link matches what the engine
+   * adapter would have produced. */
+  humanLoopConfig: HumanLoopConfig;
   startWorkflow(input: {
     workflowId: string;
     workspaceId: string;
@@ -107,6 +112,7 @@ export function createComposition(options: CompositionOptions): Composition {
     engine,
     store: options.store,
     humanSink,
+    humanLoopConfig,
     get resumeRegistry(): ResumeTurnRegistry | null { return resumeRegistry; },
     startWorkflow: (input) => engine.startWorkflow(input),
     resumeWorkflow: (workflowId) => {

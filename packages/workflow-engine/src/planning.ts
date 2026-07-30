@@ -1,5 +1,5 @@
 import { EventSchema, eventId, type EventKind, type PlatformEvent } from "@platform/contracts";
-import { hasOpenObjections, humanRuleAllows, openObjectionIds, underIterationCap } from "./guards.js";
+import { hasOpenObjections, humanRuleAllows, openObjectionIds, stalemateObjectionIds, underIterationCap } from "./guards.js";
 import { foldReducer } from "./fold.js";
 import type { EngineEffect, FoldedState, HumanDecisionInput, TransitionResult, WorkflowEngineConfig, WorkflowPhase } from "./types.js";
 
@@ -70,6 +70,25 @@ export function reducePlanning(state: FoldedState, config: WorkflowEngineConfig,
     case "evaluateObjectionGate": {
       if (state.phase !== "objection_gate" && state.phase !== "frontier_to_objections") {
         return { accepted: false, state, effects: [], reason: `illegal evaluateObjectionGate in ${state.phase}` };
+      }
+      const stalemateIds = stalemateObjectionIds(state);
+      if (stalemateIds.length > 0) {
+        const event = asEvent({
+          ...eventBase(state.workflowId, iso()),
+          kind: "ObjectionStalemate",
+          payload: { objectionIds: stalemateIds },
+        });
+        const folded = foldReducer(state, event);
+        effects.push({ type: "appendEvent", event });
+        effects.push({
+          type: "notifyEscalation",
+          workflowId: state.workflowId,
+          target: config.escalationNotificationTarget,
+          reason: "objection_stalemate",
+          openObjectionIds: openObjectionIds(folded),
+        });
+        effects.push(persist(state.workflowId, folded, config, "escalated"));
+        return { accepted: true, state: folded, effects };
       }
       if (hasOpenObjections(state)) {
         if (!underIterationCap(state, config)) {

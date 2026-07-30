@@ -6,6 +6,7 @@ import {
   hasOpenObjections,
   humanRuleAllows,
   initialFoldedState,
+  stalemateObjectionIds,
   underBudgetCap,
   underIterationCap,
   withWorkflowConfig,
@@ -20,14 +21,26 @@ test("hasOpenObjections is true for any severity including minor", () => {
   assert.equal(hasOpenObjections(state()), false);
   assert.equal(hasOpenObjections(state({
     objections: {
-      "OBJ-1": { objectionId: "OBJ-1", severity: "minor", status: "open" },
+      "OBJ-1": { objectionId: "OBJ-1", severity: "minor", status: "open", reraiseCount: 0 },
     },
   })), true);
   assert.equal(hasOpenObjections(state({
     objections: {
-      "OBJ-1": { objectionId: "OBJ-1", severity: "blocking", status: "resolved" },
+      "OBJ-1": { objectionId: "OBJ-1", severity: "blocking", status: "resolved", reraiseCount: 0 },
     },
   })), false);
+});
+
+test("stalemateObjectionIds: only open objections with reraiseCount >= 1, sorted", () => {
+  assert.deepEqual(stalemateObjectionIds(state({
+    objections: {
+      "OBJ-2": { objectionId: "OBJ-2", severity: "minor", status: "open", reraiseCount: 1 },
+      "OBJ-1": { objectionId: "OBJ-1", severity: "major", status: "open", reraiseCount: 2 },
+      "OBJ-3": { objectionId: "OBJ-3", severity: "blocking", status: "open", reraiseCount: 0 },
+      "OBJ-4": { objectionId: "OBJ-4", severity: "blocking", status: "resolved", reraiseCount: 1 },
+    },
+  })), ["OBJ-1", "OBJ-2"]);
+  assert.deepEqual(stalemateObjectionIds(state()), []);
 });
 
 test("underIterationCap boundary: exact cap is not under", () => {
