@@ -51,6 +51,9 @@ export type ResumeSeed = {
   finalProposalPath?: string;
   proposalSummary?: string;
   frontierReadiness: "ready" | "not_ready" | null;
+  /** Set to 0 on resume: mid-loop frontier findings may not have been ingested when
+   * the process died, so don't skip the frontier on resume. One extra turn is harmless. */
+  lastFrontierIteration: number;
 };
 
 const str = (value: unknown): string => (value === null || value === undefined ? "" : String(value));
@@ -106,6 +109,7 @@ export function buildResumeSeed(engine: WorkflowEngine, store: PersistenceStore,
     ...(artifacts.proposalPath ? { finalProposalPath: artifacts.proposalPath } : {}),
     ...(artifacts.proposalSummary ? { proposalSummary: artifacts.proposalSummary } : {}),
     frontierReadiness: artifacts.frontierReadiness,
+    lastFrontierIteration: 0,
   };
 }
 
@@ -295,7 +299,10 @@ export function reuseImplementation(
   iterationId: string,
 ): { turnId: string; summary: string } | null {
   const turns = [...store.listTurns(workflowId)]
-    .filter((t) => str(t.iteration_id) === iterationId && str(t.state) === "completed")
+    // Implementation and verification intentionally share the post-review
+    // iteration id. Select the implementation agent so a completed verification
+    // turn cannot hide reusable implementation work.
+    .filter((t) => str(t.iteration_id) === iterationId && str(t.state) === "completed" && str(t.agent_id) === "implementation")
     .sort((a, b) => str(b.updated_at).localeCompare(str(a.updated_at)));
 
   if (turns.length === 0) return null;
