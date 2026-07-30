@@ -13,13 +13,39 @@ import { normalizeStatus, type NormalizedStatus } from "./status.js";
 import { runStartupChecks, degradedSignal, type StartupResult } from "./startup.js";
 import { readSafeArtifact, ResultFileWatcher, ResultWatchStoppedError, ResultWatchTimeoutError, type SafeArtifact } from "./watch.js";
 
-export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string>; argv?: string[]; cwd?: string; name?: string; tabId?: string };
+export type AgentSessionResume = { sessionId?: string | null; sessionPath?: string | null };
+export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string>; argv?: string[]; cwd?: string; name?: string; tabId?: string; resume?: AgentSessionResume };
 export type AgentHandle = { id: AgentId; paneId: string; workflowId: string; provider: string; role: string; sessionId: string | null; sessionPath: string | null };
 export type TurnRequest = { turnId: TurnId; workflowId: string; iterationId: string; promptPath: string; promptHash: string; resultPath: string; schemaId: string; nonce: string; deadline: Date; idleMs?: number; attempt?: "primary" | "repair" };
 export type DeliveryReceipt = { turnId: TurnId; promptHash: string; deliveredAt: string };
 export type TurnResult = SafeArtifact & { turnId: TurnId };
 export type StatusEvent = { agentId: AgentId | null; paneId: string; rawStatus: "idle" | "working" | "blocked" | "done" | "unknown"; normalizedStatus: NormalizedStatus; completionCandidate: boolean; resultCheckRequested: boolean };
 export type AgentStatus = { id: AgentId; paneId: string; status: NormalizedStatus; provider: string; role: string };
+
+/**
+ * Compose documented provider resume arguments. Current provider CLIs expose
+ * session-id reattach, but not a stable session-path argument: Claude uses
+ * `--resume <id>` and Codex uses `resume <id>`. A path is retained in the
+ * persisted metadata for reconciliation but is not guessed into argv.
+ */
+export function composeProviderReattachArgv(
+  provider: string,
+  argv: readonly string[],
+  resume?: AgentSessionResume,
+): string[] {
+  const sessionId = resume?.sessionId?.trim();
+  if (!sessionId) return [...argv];
+  if (provider === "claude") {
+    if (argv.includes("--resume") || argv.includes("-r")) return [...argv];
+    return [...argv, "--resume", sessionId];
+  }
+  if (provider === "codex") {
+    if (argv.includes("resume")) return [...argv];
+    const [executable, ...rest] = argv;
+    return [executable ?? provider, "resume", sessionId, ...rest];
+  }
+  return [...argv];
+}
 
 export interface AgentRuntime {
   start(spec: AgentSpec): Promise<AgentHandle>;
@@ -66,7 +92,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async start(spec: AgentSpec): Promise<AgentHandle> {
     if (!spec.provider.trim() || !this.config.supportedProviders.includes(spec.provider)) throw this.spawnFailure(new AgentSpawnError("unsupported_provider", spec.provider, `Unsupported provider: ${spec.provider || "missing"}.`));
     try {
-      const argv = spec.argv ?? this.config.providerArgv[spec.provider] ?? [spec.provider];
+      const baseArgv = spec.argv ?? this.config.providerArgv[spec.provider] ?? [spec.provider];
+      const argv = composeProviderReattachArgv(spec.provider, baseArgv, spec.resume);
       const name = spec.name ?? `${spec.provider}-${spec.role}`;
       const raw = await this.options.client.startAgent({ name, argv, cwd: spec.cwd ?? null, workspace_id: spec.workspaceId, tab_id: spec.tabId ?? null, env: spec.env }, this.config.operationTimeoutMs);
       const id = spec.id ?? agentId();

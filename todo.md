@@ -407,7 +407,8 @@ save it) is now its own P0 item above.
 
 ## Session resume (orchestration-level)
 
-**Status:** implemented; provider-session reattach deferred.
+**Status:** implemented, including provider-session reattach for documented
+session-id flags.
 
 **Problem it fixed:** when an agent hit its provider usage limit (e.g. Claude's 5-hour
 window) mid-run, it stopped responding, the turn deadline expired, and the orchestrator
@@ -416,8 +417,9 @@ errored out. There was no way to continue: re-launching minted a new workflow id
 which re-inited folded state and overwrote the persisted snapshot (`engine.ts:118-138`) -
 discarding all the planner<->reviewer<->frontier back-and-forth.
 
-**Scope shipped:** orchestration resume only. Agents restart as fresh provider processes
-but receive all prior objections/plans as prompt context.
+**Scope shipped:** orchestration resume plus provider-session reattach when the
+provider exposes a documented session-id flag. Agents still receive all prior
+objections/plans as prompt context.
 
 **Design (implemented):**
 - Select the workflow to resume: `PARROT_RESUME=<id>` / `--resume [id]`, else
@@ -435,8 +437,14 @@ but receive all prior objections/plans as prompt context.
 - Post-review: on resume at `approved`, reuse a completed implementation turn and
   skip to verification; otherwise re-run implementation.
 
+**Provider-session reattach (implemented):**
+- Claude 2.1.212: `claude --resume <session-id>`.
+- Codex 0.145.0: `codex resume <session-id>`.
+- Session paths remain persisted for reconciliation, but neither installed CLI
+  documents a path-based reattach flag, so paths are not guessed into argv.
+- Resume starts roles lazily with persisted session metadata; fresh starts
+  replace the stored role/session record.
+
 **Deferred / follow-up:**
-- Provider-session reattach (persist `AgentHandle.sessionId/sessionPath`, add a
-  reader, translate to provider resume argv at `runtime.ts:69`/`config.ts:35`).
 - Live end-to-end re-verification against a real Herdr daemon after an induced
   mid-run stall.

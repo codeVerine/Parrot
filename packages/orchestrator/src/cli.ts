@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { argv, cwd as processCwd, env, exit, stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
+import { agentId } from "@platform/contracts";
 import {
   defaultHerdrSocketPath,
   discoverHerdrSocket,
@@ -11,6 +12,7 @@ import {
   LineSocketTransport,
   Protocol16SocketClient,
   type AgentHandle,
+  type AgentSessionResume,
 } from "@platform/herdr-adapter";
 import { PersistenceStore } from "@platform/persistence";
 import { resolveCodebaseContext } from "./codebase-context.js";
@@ -54,6 +56,11 @@ async function main(): Promise<void> {
   // PARROT_TAB reuses an existing tab if provided.
   const tabId = env.PARROT_TAB ?? (await client.createTab(workspaceId, "parrot agents", 10_000));
 
+  // Absolute so the paths embedded in each agent's command resolve no matter what
+  // directory the agent's shell starts in.
+  const runsRoot = resolve(projectDir, env.PARROT_RUNS_ROOT ?? "runs");
+  const store = new PersistenceStore({ path: env.PARROT_DB ?? resolve(runsRoot, "parrot.db") });
+
   const specsById = new Map(ROLE_SPECS.map((spec) => [spec.id, spec]));
   const handles = new Map<string, Promise<AgentHandle>>();
   const getHandle = async (id: string): Promise<AgentHandle> => {
@@ -61,17 +68,35 @@ async function main(): Promise<void> {
     if (cached) return cached;
     const spec = specsById.get(id);
     if (!spec) throw new Error(`No role specification for ${id}`);
+    const resume = resumeRequest.requested
+      ? findStoredAgentSession(store, spec.id, spec.provider, workspaceId)
+      : undefined;
     const starting = runtime.start({
+      id: agentId(spec.id),
       provider: spec.provider,
       role: spec.role,
       workspaceId,
       tabId,
       cwd: projectDir,
       worktreeRequired: spec.worktreeRequired,
+      ...(resume ? { resume } : {}),
     });
-    handles.set(id, starting);
+    const cachedStart = starting.then((handle) => {
+      store.saveAgent({
+        agentId: spec.id,
+        paneId: handle.paneId,
+        workspaceId,
+        provider: spec.provider,
+        role: spec.role,
+        sessionId: handle.sessionId,
+        sessionPath: handle.sessionPath,
+        status: "idle",
+      });
+      return handle;
+    });
+    handles.set(id, cachedStart);
     try {
-      return await starting;
+      return await cachedStart;
     } catch (error) {
       handles.delete(id);
       throw error;
@@ -81,10 +106,6 @@ async function main(): Promise<void> {
   // are started by the runner on their first delivered turn.
   await getHandle("planner");
 
-  // Absolute so the paths embedded in each agent's command resolve no matter what
-  // directory the agent's shell starts in.
-  const runsRoot = resolve(projectDir, env.PARROT_RUNS_ROOT ?? "runs");
-  const store = new PersistenceStore({ path: env.PARROT_DB ?? resolve(runsRoot, "parrot.db") });
   const turnMaxMs = env.PARROT_TURN_MAX_MS
     ? Number(env.PARROT_TURN_MAX_MS)
     : env.PARROT_TURN_TIMEOUT_MS
@@ -255,6 +276,26 @@ async function resolveFocusedWorkspace(client: Protocol16SocketClient): Promise<
   const id = snapshot.workspace_id;
   if (!id) throw new Error("No focused Herdr workspace found; set PARROT_WORKSPACE to an id from `herdr workspace list`.");
   return id;
+}
+
+/** Find durable provider session metadata for a role when resuming a run. */
+function findStoredAgentSession(
+  store: PersistenceStore,
+  role: string,
+  provider: string,
+  workspaceId: string,
+): AgentSessionResume | undefined {
+  const row = store.readRows("agents").find(
+    (candidate) =>
+      String(candidate.role) === role &&
+      String(candidate.provider) === provider &&
+      String(candidate.workspace_id) === workspaceId,
+  );
+  if (!row) return undefined;
+  const sessionId = typeof row.agent_session_id === "string" ? row.agent_session_id : null;
+  const sessionPath = typeof row.agent_session_path === "string" ? row.agent_session_path : null;
+  if (!sessionId && !sessionPath) return undefined;
+  return { sessionId, sessionPath };
 }
 
 /**
