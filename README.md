@@ -146,7 +146,7 @@ prompt before sending the planner turn.
 ## Run
 
 ```bash
-pnpm exec tsx src/orchestrate.ts "Design the SQLite persistence layer for Parrot."
+pnpm parrot "Design the SQLite persistence layer for Parrot."
 ```
 
 Or through the package script:
@@ -364,7 +364,7 @@ Defaults:
 Example:
 
 ```bash
-PARROT_MAX_ITERATIONS=3 PARROT_TURN_TIMEOUT_MS=300000 pnpm exec tsx src/orchestrate.ts task.md
+PARROT_MAX_ITERATIONS=3 PARROT_TURN_TIMEOUT_MS=300000 pnpm parrot task.md
 ```
 
 ## Validation Commands
@@ -378,22 +378,22 @@ pnpm typecheck
 CLI usage check:
 
 ```bash
-pnpm exec tsx src/orchestrate.ts
+pnpm parrot
 ```
 
 Expected output:
 
 ```text
-Usage: pnpm exec tsx src/orchestrate.ts <prompt text | task.md> [more prompt text]
+Usage: parrot <task.md | prompt text ...>
 ```
 
 Preflight check:
 
 ```bash
-pnpm exec tsx src/orchestrate.ts task.md
+pnpm parrot task.md
 ```
 
-If panes are not renamed correctly, it should fail before sending any
+If panes are not available, it should fail before sending any
 agent instruction and print current Herdr candidates.
 
 ## Troubleshooting

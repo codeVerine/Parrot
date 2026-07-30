@@ -340,7 +340,7 @@ needed; once spawned it stays alive (cached handle) for the rest of the run.
 
 ## Run parrot against any project (portable / global command)
 
-**Priority:** P2 - **Status:** proposed.
+**Priority:** P2 - **Status:** implemented.
 
 **Problem:** after the package refactor there is no `parrot` command - the only
 runnable entry is the orchestrator package CLI, invoked with a long

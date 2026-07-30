@@ -292,7 +292,7 @@ function parseResumeRequest(args: string[]): { requested: boolean; workflowId?: 
 
 async function readTask(args: string[], projectDir: string): Promise<string> {
   if (args.length === 0) {
-    throw new Error("Usage: parrot-orchestrate <task.md | prompt text ...>");
+    throw new Error("Usage: parrot <task.md | prompt text ...>");
   }
   const parts: string[] = [];
   for (const arg of args) {
