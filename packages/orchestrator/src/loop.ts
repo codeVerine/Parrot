@@ -3,10 +3,12 @@ import { blockingFindings, escalationAttention, findingsFromReport, frontierFail
 import type { CodebaseContextFile, ObjectionView } from "@platform/llm-boundary";
 import { stalemateObjectionIds, type FoldedState, type WorkflowEngineConfig, type WorkflowPhase } from "@platform/workflow-engine";
 import type { Composition } from "./composition.js";
-import { buildStalemateReport } from "./escalation-report.js";
+import { buildChurnReport, buildStalemateReport } from "./escalation-report.js";
 import {
+  addedRemovedHeadings,
   isMajorRestructuring,
   loadProposalAtIteration,
+  weightedProposalSimilarity,
 } from "./proposal-diff.js";
 import type { ResumeSeed } from "./resume.js";
 import { readFileSync } from "node:fs";
@@ -59,13 +61,9 @@ export type ReviewLoopInput = {
     headingChangeRatio?: number;
     similarityFloor?: number;
   };
-  /**
-   * Reserved for a future churn detection heuristic. Token-set Jaccard
-   * (Phase 12's original rule) cannot distinguish a genuine revert from
-   * per-iteration vocabulary drift on real proposals. Kept as a no-op stub
-   * so callers passing legacy config don't fail validation.
-   */
+  /** Detect a high-signal proposal reversion (N -> N-2) before another review round. */
   churnDetection?: {
+    scoreFloor?: number;
     churnMargin?: number;
     disabled?: boolean;
   };
@@ -113,6 +111,9 @@ export async function runReviewLoop(
   // should fire (set threshold at 0.7 so 0.765 clears it).
   const frontierHeadingChangeRatio = input.frontierReinvoke?.headingChangeRatio ?? 0.7;
   const frontierSimilarityFloor = input.frontierReinvoke?.similarityFloor ?? 0.4;
+  const churnScoreFloor = input.churnDetection?.scoreFloor ?? 0.65;
+  const churnMargin = input.churnDetection?.churnMargin ?? 0;
+  const churnDetectionDisabled = input.churnDetection?.disabled === true;
 
   if (!input.resume) {
     comp.startWorkflow({
@@ -150,10 +151,11 @@ export async function runReviewLoop(
    * decision already advanced the engine to approved/rejected).
    */
   const resolveEscalation = async (
-    reason: "objection_stalemate" | "guardrail_conflict",
+    reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn",
     objectionIds: string[],
+    reportOverride?: string,
   ): Promise<"continue" | ReviewLoopResult> => {
-    const report = buildStalemateReport(comp.store, workflowId, objectionIds, reason);
+    const report = reportOverride ?? buildStalemateReport(comp.store, workflowId, objectionIds, reason === "plan_churn" ? "objection_stalemate" : reason);
     const choice = input.onStalemate
       ? await input.onStalemate({ workflowId, objectionIds, report, reason })
       : "abort";
@@ -299,14 +301,55 @@ export async function runReviewLoop(
           break;
         }
 
-        // Churn detection is currently a no-op. Token-set Jaccard cannot
-        // distinguish a genuine revert from per-iteration vocabulary drift on
-        // real proposals (the motivating run produced sim(N, N-2) < sim(N, N-1)
-        // on every iteration, so the relative rule never fires). The proposal-
-        // diff module is retained for the frontier re-invoke rule; a future
-        // heuristic (section-weighted, period>2) will plug into this slot.
-        // Tracked in docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md
-        // section 7 (assigned open questions).
+        // Detect a high-signal A -> B -> A reversion before dispatching any
+        // reviewer/frontier turn for the reverted proposal. Both historical
+        // proposals must be durable, completed planner artifacts; a missing
+        // artifact simply means there is not enough evidence to escalate.
+        if (iteration >= 3 && !churnDetectionDisabled && finalProposalPath) {
+          const currentText = readProposalTextOrNull(finalProposalPath);
+          const previous = loadProposalAtIteration(comp.store, workflowId, iteration - 1);
+          const prior = loadProposalAtIteration(comp.store, workflowId, iteration - 2);
+          if (currentText !== null && previous && prior) {
+            const scorePrev = weightedProposalSimilarity(currentText, previous.text);
+            const scorePrior = weightedProposalSimilarity(currentText, prior.text);
+            if (
+              scorePrior.score >= churnScoreFloor &&
+              scorePrior.score >= scorePrev.score + churnMargin
+            ) {
+              const fromIterationId = `${workflowId}-iter-${iteration - 2}`;
+              const toIterationId = `${workflowId}-iter-${iteration}`;
+              const headingDelta = addedRemovedHeadings(prior.text, currentText);
+              const detail = [
+                `component similarity: all=${scorePrior.simAll.toFixed(3)}, headings=${scorePrior.simHeadings.toFixed(3)}, steps=${scorePrior.simSteps.toFixed(3)}`,
+                `weighted score: prior=${scorePrior.score.toFixed(3)}, previous=${scorePrev.score.toFixed(3)}, floor=${churnScoreFloor.toFixed(3)}`,
+              ].join("; ");
+              const report = buildChurnReport(
+                fromIterationId,
+                toIterationId,
+                scorePrior.score,
+                detail,
+                churnMargin,
+                headingDelta,
+                { previous: scorePrev, prior: scorePrior },
+              );
+              const openObjectionIds = openIds();
+              engine.reportPlanChurn({
+                workflowId,
+                fromIterationId,
+                toIterationId,
+                similarity: scorePrior.score,
+                detail,
+                iterationId,
+                turnId: planner.turnId,
+                agentId: input.plannerAgentId,
+                notify: false,
+              });
+              const outcome = await resolveEscalation("plan_churn", openObjectionIds, report);
+              if (outcome !== "continue") return outcome;
+              break;
+            }
+          }
+        }
 
         // Resolve only objections that are not already resolved. Skip legacy
         // bare-ID addressals: a pre-Phase-10 result.toon rehydrated via

@@ -110,20 +110,32 @@ export function buildChurnReport(
   detail: string,
   margin: number,
   headings?: { added: string[]; removed: string[] },
+  components?: {
+    previous: { simAll: number; simHeadings: number; simSteps: number; score: number };
+    prior: { simAll: number; simHeadings: number; simSteps: number; score: number };
+  },
 ): string {
   const lines = [
     `Plan churn detected: iteration ${iterationNumber(toIterationId)} more similar to ${iterationNumber(fromIterationId)} than to its predecessor.`,
     `sim(N, N-2): ${(similarity * 100).toFixed(1)}% (margin: ${(margin * 100).toFixed(0)}%)`,
     detail,
   ];
-  if (headings && (headings.added.length > 0 || headings.removed.length > 0)) {
+  if (components) {
+    lines.push(
+      `components (N,N-1): all=${components.previous.simAll.toFixed(3)}, headings=${components.previous.simHeadings.toFixed(3)}, steps=${components.previous.simSteps.toFixed(3)}, score=${components.previous.score.toFixed(3)}`,
+      `components (N,N-2): all=${components.prior.simAll.toFixed(3)}, headings=${components.prior.simHeadings.toFixed(3)}, steps=${components.prior.simSteps.toFixed(3)}, score=${components.prior.score.toFixed(3)}`,
+    );
+  }
+  if (headings) {
     lines.push("");
+    lines.push("headings delta:");
+    if (headings.added.length === 0 && headings.removed.length === 0) {
+      lines.push("  (none)");
+    }
     if (headings.added.length > 0) {
-      lines.push("headings added:");
       for (const h of headings.added) lines.push(`  + ${h}`);
     }
     if (headings.removed.length > 0) {
-      lines.push("headings removed:");
       for (const h of headings.removed) lines.push(`  - ${h}`);
     }
   }

@@ -61,6 +61,10 @@ export {
   loadProposalAtIteration,
   proposalSimilarity,
   sectionHeadings,
+  sectionSteps,
+  weightedProposalSimilarity,
+  sectionWeightedSimilarity,
   type ProposalSnapshot,
   type RestructuringOptions,
+  type WeightedProposalSimilarity,
 } from "./proposal-diff.js";

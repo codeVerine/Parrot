@@ -230,8 +230,10 @@ rejected as a malformed reply."
 
 ## Plan churn / oscillation detection
 
-**Priority:** P1 (builds the shared proposal-diff signal) - **Status:** proposed.
-Loop rule. Design: `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
+**Priority:** P1 (builds the shared proposal-diff signal) - **Status:** implemented.
+Loop rule uses section-weighted proposal similarity and escalates A→B→A
+reversions before another reviewer/frontier turn. Design:
+`docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
 
 **Problem it fixes:** iteration 4 reverted to the iteration 1 approach. Weak
 models oscillate between two bad ideas as the context window fills, without
