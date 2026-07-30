@@ -71,6 +71,28 @@ export type Composition = {
   flush(): Promise<void>;
 };
 
+function iterationNumberFor(
+  store: PersistenceStore,
+  workflowId: string,
+  iterationId: string,
+): number {
+  const rows = store.readRows("iterations");
+  const existing = rows.find(
+    (row) =>
+      String(row.workflow_id) === workflowId &&
+      String(row.iteration_id) === iterationId,
+  );
+  if (existing) return Number(existing.iteration_number);
+
+  const highest = rows
+    .filter((row) => String(row.workflow_id) === workflowId)
+    .reduce(
+      (max, row) => Math.max(max, Number(row.iteration_number) || 0),
+      0,
+    );
+  return highest + 1;
+}
+
 /** Wire the @platform stack into one runnable MVP composition. Wiring only. */
 export function createComposition(options: CompositionOptions): Composition {
   const humanLoopConfig = withHumanLoopConfig(options.humanLoopConfig);
@@ -122,14 +144,32 @@ export function createComposition(options: CompositionOptions): Composition {
     },
     runTurn: (input) => runTurn(deps, input, resumeRegistry),
     runImplementation: async (input) => {
-      const result = await runImplementation(deps, input, resumeRegistry);
+      const result = await runImplementation(
+        deps,
+        {
+          ...input,
+          iterationNumber:
+            input.iterationNumber ??
+            iterationNumberFor(options.store, input.workflowId, input.iterationId),
+        },
+        resumeRegistry,
+      );
       if (result.status === "completed") {
         options.store.updatePostReviewStage(input.workflowId, "verification_pending");
       }
       return result;
     },
     runVerification: async (input) => {
-      const result = await runVerification(deps, input, resumeRegistry);
+      const result = await runVerification(
+        deps,
+        {
+          ...input,
+          iterationNumber:
+            input.iterationNumber ??
+            iterationNumberFor(options.store, input.workflowId, input.iterationId),
+        },
+        resumeRegistry,
+      );
       if (result.status === "valid") {
         const parsed = ResolutionResultSchema.safeParse(result.payload);
         if (parsed.success && parsed.data.verified.includes(input.targetTurnId) && parsed.data.unresolved.length === 0) {

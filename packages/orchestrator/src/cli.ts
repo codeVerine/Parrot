@@ -17,7 +17,11 @@ import {
   type AgentHandle,
 } from "@platform/herdr-adapter";
 import { PersistenceStore } from "@platform/persistence";
-import { findStoredAgentSession, workflowRoleAgentKey } from "./agent-session.js";
+import {
+  findStoredAgent,
+  workflowRoleAgentKey,
+  workflowRoleAgentName,
+} from "./agent-session.js";
 import { resolveCodebaseContext } from "./codebase-context.js";
 import { createComposition } from "./composition.js";
 import { createHerdrRunner } from "./herdr-runner.js";
@@ -139,19 +143,24 @@ async function main(): Promise<void> {
     const cwd = usesWorkflowWorktree
       ? ensureWorktree({ projectDir, workflowId, ...(worktreeRoot ? { worktreeRoot } : {}) }).path
       : projectDir;
-    const resume = resumeRequest.requested
-      ? findStoredAgentSession(store, workflowId, spec.id, spec.provider, workspaceId)
+    const storedAgent = resumeRequest.requested
+      ? findStoredAgent(store, workflowId, spec.id, spec.provider, workspaceId)
       : undefined;
-    const starting = runtime.start({
+    const agentSpec = {
       id: agentId(agentKey),
       provider: spec.provider,
       role: spec.role,
+      name: workflowRoleAgentName(workflowId, spec.provider, spec.id),
       workspaceId,
       tabId,
       cwd,
       worktreeRequired: spec.worktreeRequired,
-      ...(resume ? { resume } : {}),
-    });
+      ...(storedAgent ? { resume: storedAgent.resume } : {}),
+    };
+    const starting = storedAgent
+      ? runtime.attach({ ...agentSpec, paneId: storedAgent.paneId })
+          .then((attached) => attached ?? runtime.start(agentSpec))
+      : runtime.start(agentSpec);
     const cachedStart = starting.then((handle) => {
       store.saveAgent({
         agentId: agentKey,
@@ -293,6 +302,12 @@ async function main(): Promise<void> {
         if (impl.status === "completed") {
           implTurnId = impl.turnId;
           implSummary = impl.summary;
+        } else if (impl.status === "deviation") {
+          console.log(`Deviation request: ${impl.deviationRequest}`);
+        } else if (impl.status === "blocked") {
+          console.log(`Implementation blocked: ${impl.summary}`);
+        } else {
+          console.log(`Implementation failed: ${impl.reason}`);
         }
       }
 

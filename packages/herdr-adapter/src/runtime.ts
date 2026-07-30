@@ -49,6 +49,7 @@ export function composeProviderReattachArgv(
 
 export interface AgentRuntime {
   start(spec: AgentSpec): Promise<AgentHandle>;
+  attach(spec: AgentSpec & { paneId: string }): Promise<AgentHandle | null>;
   send(id: AgentId, turn: TurnRequest): Promise<DeliveryReceipt>;
   wait(id: AgentId, turnId: TurnId, timeoutMs: number): Promise<RuntimeSignal>;
   result(id: AgentId, turnId: TurnId): Promise<TurnResult>;
@@ -95,7 +96,10 @@ export class HerdrAgentRuntime implements AgentRuntime {
       const baseArgv = spec.argv ?? this.config.providerArgv[spec.provider] ?? [spec.provider];
       const argv = composeProviderReattachArgv(spec.provider, baseArgv, spec.resume);
       const name = spec.name ?? `${spec.provider}-${spec.role}`;
-      const raw = await this.options.client.startAgent({ name, argv, cwd: spec.cwd ?? null, workspace_id: spec.workspaceId, tab_id: spec.tabId ?? null, env: spec.env }, this.config.operationTimeoutMs);
+      const started = await this.options.client.startAgent({ name, argv, cwd: spec.cwd ?? null, workspace_id: spec.workspaceId, tab_id: spec.tabId ?? null, env: spec.env }, this.config.operationTimeoutMs);
+      const raw = normalizeStatus(started).normalizedStatus === "idle"
+        ? started
+        : await this.waitForAgentReady(started.pane_id, spec.provider);
       const id = spec.id ?? agentId();
       const status = normalizeStatus(raw).normalizedStatus;
       const identity = this.identity.bind({ agentId: id, paneId: raw.pane_id, workflowId: spec.workspaceId, provider: spec.provider, role: spec.role, status, sessionId: raw.agent_session_id, sessionPath: raw.agent_session_path });
@@ -106,6 +110,47 @@ export class HerdrAgentRuntime implements AgentRuntime {
       if (error instanceof AgentSpawnError) throw error;
       throw this.spawnFailure(new AgentSpawnError("spawn_error", spec.provider, error instanceof Error ? error.message : String(error)));
     }
+  }
+
+  async attach(spec: AgentSpec & { paneId: string }): Promise<AgentHandle | null> {
+    if (!spec.id) throw new Error("Attaching an agent requires a stable platform agent id.");
+    const agents = await this.options.client.listAgents(this.config.operationTimeoutMs);
+    const existing = agents.find((candidate) => candidate.pane_id === spec.paneId);
+    if (!existing) return null;
+    if (existing.workspace_id !== spec.workspaceId || existing.agent !== spec.provider) return null;
+
+    const existingStatus = normalizeStatus(existing).normalizedStatus;
+    const raw = existingStatus === "unknown"
+      ? await this.waitForAgentReady(existing.pane_id, spec.provider)
+      : existing;
+    const status = normalizeStatus(raw).normalizedStatus;
+    const identity = this.identity.bind({
+      agentId: spec.id,
+      paneId: raw.pane_id,
+      workflowId: spec.workspaceId,
+      provider: spec.provider,
+      role: spec.role,
+      status,
+      sessionId: raw.agent_session_id,
+      sessionPath: raw.agent_session_path,
+    });
+    try {
+      await this.options.client.subscribeAgentStatus(
+        identity.paneId,
+        this.config.operationTimeoutMs,
+      );
+    } catch {
+      // Per-pane status is best-effort; result artifacts remain authoritative.
+    }
+    return {
+      id: identity.agentId,
+      paneId: identity.paneId,
+      workflowId: identity.workflowId,
+      provider: identity.provider,
+      role: identity.role,
+      sessionId: identity.sessionId,
+      sessionPath: identity.sessionPath,
+    };
   }
 
   async send(id: AgentId, turn: TurnRequest): Promise<DeliveryReceipt> {
@@ -239,6 +284,35 @@ export class HerdrAgentRuntime implements AgentRuntime {
       this.moveToOrphans(key, context);
     }
     this.identity.setStatus(id, "idle");
+  }
+
+  private async waitForAgentReady(paneId: string, provider: string): Promise<HerdrAgent> {
+    const deadline = Date.now() + this.config.operationTimeoutMs;
+    let lastStatus = "unknown";
+
+    while (Date.now() < deadline) {
+      const agents = await this.options.client.listAgents(
+        Math.max(1, deadline - Date.now()),
+      );
+      const agent = agents.find((candidate) => candidate.pane_id === paneId);
+      if (agent) {
+        const status = normalizeStatus(agent).normalizedStatus;
+        lastStatus = status;
+        if (status === "idle") return agent;
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(this.config.pollIntervalMs, remaining)),
+      );
+    }
+
+    throw new AgentSpawnError(
+      "spawn_error",
+      provider,
+      `Agent pane ${paneId} did not become ready within ${this.config.operationTimeoutMs}ms (last status: ${lastStatus}).`,
+    );
   }
 
   private subscribe() {

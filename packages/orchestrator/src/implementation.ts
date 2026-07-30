@@ -48,14 +48,20 @@ export async function runImplementation(
 
   const result = turn.payload as ImplementationResult;
 
-  if (result.status === "blocked") {
+  if (result.status === "blocked" || result.deviationRequest) {
+    const reason = result.deviationRequest
+      ? `Implementation deviation requested: ${result.deviationRequest}`
+      : result.summary;
     deps.engine.reportImplementationBlocked({
       workflowId: input.workflowId,
-      reason: result.summary,
+      reason,
       iterationId: input.iterationId,
       turnId: turn.turnId,
       agentId: input.agentId,
     });
+  }
+
+  if (result.status === "blocked") {
     return { status: "blocked", turnId: turn.turnId, summary: result.summary };
   }
 

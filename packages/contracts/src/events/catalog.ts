@@ -16,7 +16,8 @@ const event = <K extends string>(kind: K, payload: z.ZodRawShape = {}) =>
   BaseEventSchema.extend({ kind: z.literal(kind), payload: z.object(payload) });
 
 // The first twelve entries are the approved Phase 1 catalog. The rest are
-// additive revisions approved by the Phase 4, Phase 7, Phase 9, and Phase 10 plans respectively.
+// additive revisions approved by the Phase 4, Phase 7, Phase 9, Phase 10, and
+// Phase 12 plans respectively.
 export const EVENT_KINDS = [
   "TurnCompleted",
   "TurnFailed",

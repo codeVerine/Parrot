@@ -62,7 +62,7 @@ Then run Parrot from the target git repository. During development, this
 repository itself is the target:
 
 ```bash
-pnpm parrot task.md
+pnpm parrot "Describe the change you want to plan and implement."
 ```
 
 A task can be one or more existing file paths, inline text arguments, or a mix
@@ -70,7 +70,7 @@ of both. Existing files are read relative to the directory where the command
 was invoked.
 
 ```bash
-pnpm parrot task.md "Also verify resume safety."
+pnpm parrot /path/to/task.md "Also verify resume safety."
 ```
 
 The CLI requires an interactive terminal for the escalation and final
@@ -254,9 +254,9 @@ packages/
 └── dashboard/          React/Vite dashboard client
 ```
 
-The root `src/` directory is the pre-package compatibility implementation. It is
-still runnable with `pnpm orchestrate:legacy`, but new work belongs in the
-workspace packages. Its retirement remains a separate gated task in `task.md`.
+Every source file lives in a workspace package under the uniform `pnpm -r`
+build, typecheck, and test graph. `@platform/orchestrator` is the single
+composition root.
 
 ## Documentation
 

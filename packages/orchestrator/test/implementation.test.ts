@@ -51,7 +51,7 @@ test("blocked result emits ImplementationBlocked, escalates, and notifies", asyn
 });
 
 test("deviation request routes back without self-authorizing", async () => {
-  const { comp } = setup((req) =>
+  const { comp, memory } = setup((req) =>
     envelope(req, "implementation", {
       status: "completed",
       summary: "core done",
@@ -68,30 +68,41 @@ test("deviation request routes back without self-authorizing", async () => {
   if (out.status === "deviation") {
     assert.match(out.deviationRequest, /scope change/);
   }
-  // Not approved: the workflow did not advance to approved on the agent's say-so.
-  assert.notEqual(comp.engine.getState("workflow-1").phase, "approved");
+  assert.equal(comp.engine.getState("workflow-1").phase, "escalated");
+  await comp.flush();
+  assert.ok(memory.requests.some((request) => request.kind === "escalation"));
 });
 
 test("completed implementation is verified through resolution_verification", async () => {
-  const { comp } = setup((req) =>
+  const { comp, store } = setup((req) =>
     req.turnType === "implementation"
       ? envelope(req, "implementation", { status: "completed", summary: "done" })
       : envelope(req, "resolution", { verified: ["turn-1"], unresolved: [] }),
   );
+  store.saveIteration({
+    iterationId: "review-iteration",
+    workflowId: "workflow-1",
+    iterationNumber: 1,
+    status: "complete",
+  });
   const impl = await comp.runImplementation({
     workflowId: "workflow-1",
-    iterationId: "iteration-1",
+    iterationId: "post-review",
     agentId: "agent-impl",
     task: "Implement the approved plan",
   });
   assert.equal(impl.status, "completed");
   const verify = await comp.runVerification({
     workflowId: "workflow-1",
-    iterationId: "iteration-1",
+    iterationId: "post-review",
     agentId: "agent-verify",
     targetTurnId: impl.turnId,
     summary: impl.status === "completed" ? impl.summary : "",
     evidence: ["src/auth.ts:42"],
   });
   assert.equal(verify.status, "valid");
+  const postReview = store.readRows("iterations").find(
+    (row) => row.iteration_id === "post-review",
+  );
+  assert.equal(postReview?.iteration_number, 2);
 });

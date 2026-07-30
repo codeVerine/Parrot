@@ -36,17 +36,6 @@ Before enabling the rule:
 Design record:
 `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
 
-### Retire the legacy root orchestrator
-
-**Priority:** P1
-
-**Status:** pending live parity approval
-
-The current runtime is `@platform/orchestrator`; the root `src/` tree remains a
-compatibility implementation behind `pnpm orchestrate:legacy`. Follow the
-guarded acceptance criteria in `task.md` before deleting it. Until then, keep the
-root TypeScript check and its dependencies.
-
 ### Reconstruct the last frontier iteration on resume
 
 **Priority:** P2
@@ -123,6 +112,8 @@ The current package implementation includes:
 - notification-after-interactive-resolution ordering;
 - concise per-turn terminal progress;
 - lazy role spawning;
+- workflow-scoped Herdr pane names and durable pane reattachment;
+- verified prompt submission when a successful pane command remains queued;
 - portable/global `parrot` entrypoint;
 - isolated implementation worktrees with collision-safe identity and ownership
   validation; and

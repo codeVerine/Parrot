@@ -38,14 +38,13 @@ The root scripts are the authoritative full-repository commands:
 | Command | Purpose |
 |---|---|
 | `pnpm build` | Build every workspace package |
-| `pnpm typecheck` | Build dependencies, typecheck every package, and typecheck the retained root compatibility stack |
+| `pnpm typecheck` | Build dependencies and typecheck every package |
 | `pnpm test` | Run every package test script |
 | `pnpm parrot <task>` | Run the packaged CLI from source with `tsx` |
 | `pnpm orchestrate <task>` | Run the orchestrator package entrypoint from source |
-| `pnpm orchestrate:legacy <task>` | Run the retained root compatibility implementation |
 
-New runtime behavior belongs in the packages, especially
-`packages/orchestrator`; do not add features to the root compatibility stack.
+All runtime behavior belongs in the packages, especially
+`packages/orchestrator`.
 
 ## Source conventions
 

@@ -29,9 +29,6 @@ The packaged CLI reads the following variables directly:
 | `HERDR_BIN` | executable | `herdr` | Used for CLI operations and socket discovery |
 | `HERDR_SOCKET` | path | discovered/default socket | Highest-precedence socket selection |
 
-The root compatibility CLI additionally reads `PARROT_MAX_ITERATIONS`; the
-packaged CLI does not expose that variable.
-
 ## Workflow engine defaults
 
 `DEFAULT_WORKFLOW_CONFIG` in `@platform/workflow-engine`:
