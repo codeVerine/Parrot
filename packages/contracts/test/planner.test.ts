@@ -93,4 +93,7 @@ test("PlannerResultSchema rejects structured addressals with missing required fi
   assert.throws(() => PlannerResultSchema.parse(base([
     { objectionId: "", resolutionStrategy: "revised_plan", evidence: "quote", requiresGuardrailException: false },
   ])));
+  assert.throws(() => PlannerResultSchema.parse(base([
+    { objectionId: "OBJ-1", resolutionStrategy: "revised_plan", evidence: "quote", requiresGuardrailException: false, extra: true },
+  ])));
 });

@@ -5,7 +5,7 @@ export const ObjectionAddressalSchema = z.object({
   resolutionStrategy: z.enum(["revised_plan", "retracted", "conceded"]),
   evidence: z.string().min(1), // exact quote from proposal.md or pasted code
   requiresGuardrailException: z.boolean(),
-});
+}).strict();
 export type ObjectionAddressal = z.infer<typeof ObjectionAddressalSchema>;
 
 /**
