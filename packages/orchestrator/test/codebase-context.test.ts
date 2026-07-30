@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { PromptBuilder, withLlmBoundaryConfig } from "@platform/llm-boundary";
 import { resolveCodebaseContext } from "../src/codebase-context.js";
 
 function createFixtureRepo(): string {
@@ -23,7 +24,8 @@ function createFixtureRepo(): string {
   writeFileSync(join(root, "dist", "ignored.ts"), "dist content\n");
   writeFileSync(join(root, "runs", "ignored.ts"), "runs content\n");
 
-  const outside = join(root, "outside.txt");
+  const outsideRoot = mkdtempSync(join(tmpdir(), "parrot-codebase-context-outside-"));
+  const outside = join(outsideRoot, "outside.txt");
   writeFileSync(outside, "outside content\n");
   symlinkSync(outside, join(root, "src", "outside-link.ts"));
 
@@ -53,6 +55,37 @@ test("resolves codebase context in first-mention order and applies byte caps", (
     first.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0),
     25,
   );
+});
+
+test("local planner prompt smoke includes referenced snippets within the configured cap", () => {
+  const projectDir = createFixtureRepo();
+  const task = "Use `src/loop.ts` when planning the change.";
+  const codebaseContext = resolveCodebaseContext({
+    projectDir,
+    task,
+    maxFiles: 1,
+    maxBytesPerFile: 12,
+    maxTotalBytes: 12,
+  });
+  const built = new PromptBuilder({
+    config: withLlmBoundaryConfig(),
+    nonceFactory: () => "smoke-nonce",
+  }).build({
+    turnType: "planner_propose",
+    identity: { workflowId: "smoke", iterationId: "iter-1", turnId: "turn-1" },
+    context: { task, codebaseContext },
+    write: false,
+  });
+
+  assert.ok(codebaseContext.length > 0);
+  assert.ok(
+    codebaseContext.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0) <= 12,
+  );
+  assert.match(built.content, /## Codebase Context/);
+  assert.match(built.content, /### src\/loop\.ts/);
+  assert.match(built.content, /loop file/);
+  assert.doesNotMatch(built.content, /### src\/config\.ts/);
+  assert.match(built.content, /smoke-nonce/);
 });
 
 test("rejects traversal, symlink escapes, excluded directories, and binary files", () => {
