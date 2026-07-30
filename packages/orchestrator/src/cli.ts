@@ -49,24 +49,37 @@ async function main(): Promise<void> {
 
   const workspaceId = env.PARROT_WORKSPACE ?? (await resolveFocusedWorkspace(client));
 
-  // Spawn every agent into a dedicated tab so they do not split the caller's terminal
-  // pane down to an unreadable size. PARROT_TAB reuses an existing tab if provided.
+  // Spawn agents into one dedicated tab so they do not split the caller's terminal
+  // pane down to an unreadable size. Individual role panes are started lazily;
+  // PARROT_TAB reuses an existing tab if provided.
   const tabId = env.PARROT_TAB ?? (await client.createTab(workspaceId, "parrot agents", 10_000));
 
-  const handles = new Map<string, AgentHandle>();
-  for (const spec of ROLE_SPECS) {
-    handles.set(
-      spec.id,
-      await runtime.start({
-        provider: spec.provider,
-        role: spec.role,
-        workspaceId,
-        tabId,
-        cwd: projectDir,
-        worktreeRequired: spec.worktreeRequired,
-      }),
-    );
-  }
+  const specsById = new Map(ROLE_SPECS.map((spec) => [spec.id, spec]));
+  const handles = new Map<string, Promise<AgentHandle>>();
+  const getHandle = async (id: string): Promise<AgentHandle> => {
+    const cached = handles.get(id);
+    if (cached) return cached;
+    const spec = specsById.get(id);
+    if (!spec) throw new Error(`No role specification for ${id}`);
+    const starting = runtime.start({
+      provider: spec.provider,
+      role: spec.role,
+      workspaceId,
+      tabId,
+      cwd: projectDir,
+      worktreeRequired: spec.worktreeRequired,
+    });
+    handles.set(id, starting);
+    try {
+      return await starting;
+    } catch (error) {
+      handles.delete(id);
+      throw error;
+    }
+  };
+  // The planner is the only pane needed before the first turn. All other roles
+  // are started by the runner on their first delivered turn.
+  await getHandle("planner");
 
   // Absolute so the paths embedded in each agent's command resolve no matter what
   // directory the agent's shell starts in.
@@ -80,7 +93,7 @@ async function main(): Promise<void> {
   const turnIdleMs = env.PARROT_TURN_IDLE_TIMEOUT_MS ? Number(env.PARROT_TURN_IDLE_TIMEOUT_MS) : undefined;
   const runner = createHerdrRunner({
     runtime,
-    handles,
+    getHandle,
     ...(turnMaxMs ? { maxMs: turnMaxMs } : {}),
     ...(turnIdleMs ? { idleTimeoutMs: turnIdleMs } : {}),
   });

@@ -309,7 +309,7 @@ overview of the whole run from one place, without visiting each pane.
 
 ## Lazy / on-demand agent spawning
 
-**Priority:** P2 - **Status:** proposed.
+**Priority:** P2 - **Status:** implemented.
 
 **Problem:** `parrot next <task> orchestrate` spawns all 5 agent panes up front
 (`packages/orchestrator/src/cli.ts:51-63` loops over `ROLE_SPECS` and calls

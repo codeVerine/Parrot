@@ -4,8 +4,8 @@ import type { AgentRunner, AgentTurnRequest } from "./runner.js";
 
 export type HerdrRunnerOptions = {
   runtime: HerdrAgentRuntime;
-  /** Orchestrator agent id (planner/reviewer/...) to a started Herdr agent handle. */
-  handles: ReadonlyMap<string, AgentHandle>;
+  /** Resolve (and, in production, lazily start) a Herdr handle for an orchestrator agent id. */
+  getHandle: (agentId: string) => Promise<AgentHandle>;
   /** Absolute per-turn ceiling regardless of activity. */
   maxMs?: number;
   /** Fail a turn only after this much silence; the timer resets on each result-dir write. */
@@ -29,7 +29,7 @@ export function createHerdrRunner(options: HerdrRunnerOptions): AgentRunner {
   const idleMs = options.idleTimeoutMs ?? 10 * 60 * 1000;
   return {
     async deliver(request: AgentTurnRequest) {
-      const handle = options.handles.get(request.agentId);
+      const handle = await options.getHandle(request.agentId);
       if (!handle) throw new Error(`No Herdr agent bound for ${request.agentId}`);
       const agentId = handle.id as AgentId;
       const turnId = request.turnId as TurnId;
