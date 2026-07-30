@@ -256,7 +256,8 @@ notice they are going in circles.
 ## Re-invoke the frontier after major plan restructurings
 
 **Priority:** P1 (depends on the churn-detector diff signal) - **Status:**
-proposed. Loop rule. Design: `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
+implemented. The loop re-invokes frontier after a detected restructuring.
+Design: `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
 
 **Problem it fixes:** the frontier ran only on iteration 1. Its original risk-2
 ("parity run still pending") was about process state, not about whether machine
