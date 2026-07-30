@@ -300,42 +300,44 @@ export function reuseImplementation(
 ): { turnId: string; summary: string } | null {
   const turns = [...store.listTurns(workflowId)]
     // Implementation and verification intentionally share the post-review
-    // iteration id. Select the implementation agent so a completed verification
+    // iteration id. Inspect the persisted role so a completed verification
     // turn cannot hide reusable implementation work.
-    .filter((t) => str(t.iteration_id) === iterationId && str(t.state) === "completed" && str(t.agent_id) === "implementation")
+    .filter((t) => str(t.iteration_id) === iterationId && str(t.state) === "completed")
     .sort((a, b) => str(b.updated_at).localeCompare(str(a.updated_at)));
 
-  if (turns.length === 0) return null;
+  for (const turn of turns) {
+    const identity = {
+      workflowId: str(turn.workflow_id),
+      iterationId: str(turn.iteration_id),
+      turnId: str(turn.turn_id),
+      nonce: str(turn.nonce),
+    };
+    const envelope = readEnvelope(str(turn.result_path), identity);
+    if (!envelope) {
+      // We can identify implementation rows by the stable production agent id;
+      // verification corruption is handled by verificationCompleted below.
+      if (str(turn.agent_id) === "implementation") {
+        throw new Error(
+          `Durable state inconsistency: completed implementation turn ${identity.turnId} has a missing or corrupt result artifact.`,
+        );
+      }
+      continue;
+    }
+    if (envelope.role !== "implementation") continue;
 
-  // Validate the newest completed implementation turn. If its artifact is
-  // missing or invalid, throw — do not fall back to older work.
-  const turn = turns[0]!;
-  const identity = {
-    workflowId: str(turn.workflow_id),
-    iterationId: str(turn.iteration_id),
-    turnId: str(turn.turn_id),
-    nonce: str(turn.nonce),
-  };
-  const envelope = readEnvelope(str(turn.result_path), identity);
-  if (!envelope) {
-    throw new Error(
-      `Durable state inconsistency: completed implementation turn ${identity.turnId} has a missing or corrupt result artifact.`,
-    );
-  }
-  if (envelope.role !== "implementation") {
-    // Not an implementation turn — no reusable implementation.
+    const impl = ImplementationResultSchema.safeParse({ role: "implementation", ...envelope.payload });
+    if (!impl.success) {
+      throw new Error(
+        `Durable state inconsistency: completed implementation turn ${identity.turnId} has an invalid result.`,
+      );
+    }
+    if (impl.data.status === "completed" && !impl.data.deviationRequest) {
+      return { turnId: str(turn.turn_id), summary: impl.data.summary };
+    }
+    // The newest implementation was valid but blocked/requested a deviation;
+    // do not fall back to an older implementation.
     return null;
   }
-  const impl = ImplementationResultSchema.safeParse({ role: "implementation", ...envelope.payload });
-  if (!impl.success) {
-    throw new Error(
-      `Durable state inconsistency: completed implementation turn ${identity.turnId} has an invalid result.`,
-    );
-  }
-  if (impl.data.status === "completed" && !impl.data.deviationRequest) {
-    return { turnId: str(turn.turn_id), summary: impl.data.summary };
-  }
-  // Completed with blocked/deviation status is valid but non-reusable.
   return null;
 }
 
@@ -378,38 +380,37 @@ export function verificationCompleted(store: PersistenceStore, workflowId: strin
     .filter((t) => str(t.iteration_id) === iterationId && str(t.state) === "completed")
     .sort((a, b) => str(b.updated_at).localeCompare(str(a.updated_at)));
 
-  if (turns.length === 0) return false;
+  for (const turn of turns) {
+    const identity = {
+      workflowId: str(turn.workflow_id),
+      iterationId: str(turn.iteration_id),
+      turnId: str(turn.turn_id),
+      nonce: str(turn.nonce),
+    };
+    const envelope = readEnvelope(str(turn.result_path), identity);
+    if (!envelope) {
+      if (str(turn.agent_id) === "verifier") {
+        throw new Error(
+          `Durable state inconsistency: completed verification turn ${identity.turnId} has a missing or corrupt result artifact.`,
+        );
+      }
+      continue;
+    }
+    if (envelope.role !== "resolution") continue;
 
-  // Validate the newest completed verification turn. If its artifact is
-  // missing or invalid, throw — do not fall back to older work.
-  const turn = turns[0]!;
-  const identity = {
-    workflowId: str(turn.workflow_id),
-    iterationId: str(turn.iteration_id),
-    turnId: str(turn.turn_id),
-    nonce: str(turn.nonce),
-  };
-  const envelope = readEnvelope(str(turn.result_path), identity);
-  if (!envelope) {
-    throw new Error(
-      `Durable state inconsistency: completed verification turn ${identity.turnId} has a missing or corrupt result artifact.`,
-    );
+    const parsed = ResolutionResultSchema.safeParse({ role: "resolution", ...envelope.payload });
+    if (!parsed.success) {
+      throw new Error(
+        `Durable state inconsistency: completed verification turn ${identity.turnId} has an invalid result.`,
+      );
+    }
+    // The newest verification is authoritative. It is complete only if there
+    // are no unresolved findings and the target turn is verified.
+    if (parsed.data.unresolved.length > 0) return false;
+    if (targetTurnId && !parsed.data.verified.includes(targetTurnId)) return false;
+    return true;
   }
-  if (envelope.role !== "resolution") {
-    // Not a verification turn — no completed verification.
-    return false;
-  }
-  const parsed = ResolutionResultSchema.safeParse({ role: "resolution", ...envelope.payload });
-  if (!parsed.success) {
-    throw new Error(
-      `Durable state inconsistency: completed verification turn ${identity.turnId} has an invalid result.`,
-    );
-  }
-  // Verification is only complete if there are no unresolved findings and
-  // the target turn is in the verified array (if target is specified).
-  if (parsed.data.unresolved.length > 0) return false;
-  if (targetTurnId && !parsed.data.verified.includes(targetTurnId)) return false;
-  return true;
+  return false;
 }
 
 /**
