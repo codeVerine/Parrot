@@ -111,13 +111,14 @@ defect - so it should have escalated to the human early instead of looping. Two
 distinct failure modes drove the waste: (a) weak agents hallucinating APIs /
 producing unbuildable tooling, and (b) no loop-level circuit breaker on
 re-raises, churn, or guardrail conflicts. The items below are concrete fixes;
-each is proposed, none implemented.
+items 3-5 (root cause + circuit breaker) are implemented, the rest proposed.
 
 ## Planner must cite codebase evidence; engine injects repo context
 
 **Priority:** P1 (root cause - do before the other loop fixes) - **Status:**
-proposed. Combines a prompt-guard (cite-or-block) with an engine-side context
+implemented. Combines a prompt-guard (cite-or-block) with an engine-side context
 injection - two complementary defenses against hallucinated schemas.
+Design: `docs/phases/phase-8-repo-context-and-evidence-citations.md`.
 
 **Problem it fixes:** rev 3's verifier assumed `turn_type` on turn rows,
 `saveDecision` on approval, and a persisted runner discriminator - none of which
@@ -148,8 +149,9 @@ model use correct field names from a pasted schema instead of guessing.
 
 ## Hard escalation on objection re-raise (engine-enforced)
 
-**Priority:** P1 - **Status:** proposed. Loop rule enforced by the workflow engine
-on objection IDs.
+**Priority:** P1 - **Status:** implemented. Loop rule enforced by the workflow
+engine on objection IDs. Design:
+`docs/phases/phase-9-objection-stalemate-escalation.md`.
 
 **Problem it fixes:** the loop spun 3 iterations on risk-1/2/3. A weak planner
 keeps patching a fundamentally flawed concept; a weak reviewer keeps re-raising
@@ -174,8 +176,9 @@ human intervenes. Would have cut iterations 3 and 4 of the observed run.
 
 ## Structured objection addressal + guardrail-conflict escalation
 
-**Priority:** P1 - **Status:** proposed. Forces a strict objection-addressal
-schema and a new escalation type distinct from `deviationRequest`.
+**Priority:** P1 - **Status:** implemented. Forces a strict objection-addressal
+schema and a new escalation type distinct from `deviationRequest`. Design:
+`docs/phases/phase-10-structured-addressal-and-guardrail-conflicts.md`.
 
 **Problem it fixes:** weak planners answer objections with vague prose ("I have
 handled the transport risk by...") instead of concrete bindings, so weak reviewers
@@ -208,8 +211,8 @@ iterations building a workaround that the guardrails forbid.
 
 ## Reviewer must justify a clean bill of health (cleanRationale)
 
-**Priority:** P1 (cheap win) - **Status:** proposed. Prompt change (reviewer role
-instructions).
+**Priority:** P1 (cheap win) - **Status:** implemented. Extraction-enforced clean
+pass with reviewer prompt guidance. Design: `docs/phases/phase-11-reviewer-clean-rationale.md`.
 
 **Problem it fixes:** the iter-1 no-op. The reviewer returned zero objections
 without reasoning about the parity precondition or the destructive-delete risk,
@@ -228,7 +231,7 @@ rejected as a malformed reply."
 ## Plan churn / oscillation detection
 
 **Priority:** P1 (builds the shared proposal-diff signal) - **Status:** proposed.
-Loop rule.
+Loop rule. Design: `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
 
 **Problem it fixes:** iteration 4 reverted to the iteration 1 approach. Weak
 models oscillate between two bad ideas as the context window fills, without
@@ -251,7 +254,7 @@ notice they are going in circles.
 ## Re-invoke the frontier after major plan restructurings
 
 **Priority:** P1 (depends on the churn-detector diff signal) - **Status:**
-proposed. Loop rule.
+proposed. Loop rule. Design: `docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md`.
 
 **Problem it fixes:** the frontier ran only on iteration 1. Its original risk-2
 ("parity run still pending") was about process state, not about whether machine
