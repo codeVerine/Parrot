@@ -55,6 +55,8 @@ export type ReviewLoopInput = {
    * from the event log) and the loop's scratch is seeded from the database.
    */
   resume?: ResumeSeed;
+  /** Emit one concise line after each planner/reviewer/frontier turn completes. */
+  onProgress?: (line: string) => void;
   /** Mid-loop frontier re-invoke when the planner restructures the proposal. */
   frontierReinvoke?: {
     disabled?: boolean;
@@ -234,8 +236,12 @@ export async function runReviewLoop(
           iterationNumber: iteration,
           inputObjectionIds,
         });
-        if (planner.status !== "valid") return finalize({ failedTurnId: planner.turnId });
+        if (planner.status !== "valid") {
+          input.onProgress?.(`[planner iter ${iteration}] failed: ${compactProgress(planner.reason)}`);
+          return finalize({ failedTurnId: planner.turnId });
+        }
         const plannerPayload = planner.payload as PlannerResult;
+        input.onProgress?.(`[planner iter ${iteration}] ${compactProgress(plannerPayload.summary)}`);
         finalProposalPath = plannerPayload.proposalPath;
         proposalSummary = plannerPayload.summary;
 
@@ -402,8 +408,18 @@ export async function runReviewLoop(
               ...codebaseContextArgs,
             },
           });
-          if (reviewer.status !== "valid") continue;
-          for (const objection of (reviewer.payload as ReviewerResult).objections) {
+          if (reviewer.status !== "valid") {
+            input.onProgress?.(`[${isAdversarial ? "adversarial" : "reviewer"} iter ${iteration}] failed: ${compactProgress(reviewer.reason)}`);
+            continue;
+          }
+          const reviewerPayload = reviewer.payload as ReviewerResult;
+          input.onProgress?.(
+            `[${isAdversarial ? "adversarial" : "reviewer"} iter ${iteration}] objections=${reviewerPayload.objections.length}` +
+              (reviewerPayload.objections.length === 0 && reviewerPayload.cleanRationale?.trim()
+                ? ", cleanRationale=present"
+                : ""),
+          );
+          for (const objection of reviewerPayload.objections) {
             // Skip if this exact objection ID is already persisted from the same reviewer turn.
             const existingView = views.get(objection.id);
             if (existingView && existingView.turnId === reviewer.turnId) continue;
@@ -466,6 +482,7 @@ export async function runReviewLoop(
                 });
                 if (frontier.status === "valid") {
                   const midLoopPayload = frontier.payload as FrontierResult;
+                  input.onProgress?.(frontierProgressLine(iteration, midLoopPayload));
                   frontierReadiness = midLoopPayload.readiness;
                   ingestFrontierFindings(
                     comp,
@@ -523,6 +540,7 @@ export async function runReviewLoop(
           },
         });
         if (frontier.status !== "valid") {
+          input.onProgress?.(`[frontier iter ${iteration}] failed: ${compactProgress(frontier.reason)}`);
           await comp.humanSink.notify(
             frontierFailedAttention(workflowId, comp.humanLoopConfig, "frontier_turn_failed"),
           );
@@ -530,6 +548,7 @@ export async function runReviewLoop(
         }
         const frontierPayload = frontier.payload as FrontierResult;
         frontierReadiness = frontierPayload.readiness;
+        input.onProgress?.(frontierProgressLine(iteration, frontierPayload));
 
         const frontierBlockingCount = blockingFindings(
           findingsFromReport(frontierPayload, { turnId: frontier.turnId }),
@@ -624,6 +643,15 @@ function raiseObjection(
     status: "open",
     raisedBy: agentId,
   });
+}
+
+function compactProgress(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > 240 ? `${compact.slice(0, 237)}...` : compact;
+}
+
+function frontierProgressLine(iteration: number, payload: FrontierResult): string {
+  return `[frontier iter ${iteration}] readiness=${payload.readiness}, risks=${payload.risks.length}, questions=${payload.questions.length}`;
 }
 
 function readProposalTextOrNull(path: string): string | null {

@@ -51,6 +51,7 @@ const loopInput = {
 };
 
 test("clean loop reaches approved through the human gate", async () => {
+  const progress: string[] = [];
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: [] });
@@ -61,10 +62,15 @@ test("clean loop reaches approved through the human gate", async () => {
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
 
-  const result = await runReviewLoop(comp, loopInput);
+  const result = await runReviewLoop(comp, { ...loopInput, onProgress: (line) => progress.push(line) });
   assert.equal(result.phase, "approved");
   assert.equal(result.frontierReadiness, "ready");
   assert.equal(result.finalProposalPath, "plan.md");
+  assert.deepEqual(progress, [
+    "[planner iter 1] ship the login rate limiter",
+    "[reviewer iter 1] objections=0, cleanRationale=present",
+    "[frontier iter 1] readiness=ready, risks=0, questions=0",
+  ]);
 });
 
 test("reviewer objection forces a revise, then converges to approved", async () => {

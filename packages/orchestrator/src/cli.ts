@@ -162,6 +162,7 @@ async function main(): Promise<void> {
       frontierAgentId: "frontier",
       decide,
       onStalemate,
+      onProgress: (line) => console.log(line),
       codebaseContext,
       ...(resumeSeed ? { resume: resumeSeed } : {}),
     });
@@ -180,7 +181,7 @@ async function main(): Promise<void> {
       if (reused) {
         implTurnId = reused.turnId;
         implSummary = reused.summary;
-        console.log("Implementation: reused (completed before interruption)");
+        console.log("[implementation post-review] reused (completed before interruption)");
       } else {
         const impl = await comp.runImplementation({
           workflowId,
@@ -189,7 +190,7 @@ async function main(): Promise<void> {
           task,
           ...(review.finalProposalPath ? { proposalPath: review.finalProposalPath } : {}),
         });
-        console.log(`Implementation: ${impl.status}`);
+        console.log(`[implementation post-review] status=${impl.status}`);
         if (impl.status === "completed") {
           implTurnId = impl.turnId;
           implSummary = impl.summary;
@@ -198,7 +199,7 @@ async function main(): Promise<void> {
 
       if (implTurnId !== undefined && implSummary !== undefined) {
         if (verificationCompleted(store, workflowId, iterationId, implTurnId)) {
-          console.log("Verification: reused (completed before interruption)");
+          console.log("[verification post-review] reused (completed before interruption)");
           store.updatePostReviewStage(workflowId, "complete");
         } else {
           const verify = await comp.runVerification({
@@ -209,7 +210,7 @@ async function main(): Promise<void> {
             summary: implSummary,
             evidence: [],
           });
-          console.log(`Verification: ${verify.status}`);
+          console.log(`[verification post-review] status=${verify.status}`);
         }
       }
     }

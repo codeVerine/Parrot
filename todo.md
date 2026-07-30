@@ -282,7 +282,7 @@ implementability gaps.
 
 ## Per-turn progress in the orchestrator terminal
 
-**Priority:** P2 - **Status:** proposed.
+**Priority:** P2 - **Status:** implemented.
 
 **Problem:** while agents run, the orchestrator terminal (where `parrot next
 <task> orchestrate` was launched) shows no live progress. Current output is only
