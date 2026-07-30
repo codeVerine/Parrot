@@ -1,6 +1,15 @@
 # Parrot User Interface Plan (iteration 2)
 
-Based on `Multi-Agent-Orchestration-Architecture-v0.2.md` (version 0.2) and the current MVP in `src/`. Revises the iteration 1 plan to resolve OBJ-001 (read-model contract ordering) and OBJ-002 (gate compare-and-set primitive).
+> **Historical proposal.** This plan predates the packaged runtime and SQLite
+> implementation. The current shipped surface is a Vite client plus the
+> `@platform/human-loop` read-model/API library; the main CLI does not yet expose
+> the full subcommand set or start a dashboard server. See
+> `docs/ARCHITECTURE.md` and `packages/dashboard/README.md`.
+
+At the time it was written, this plan was based on
+`Multi-Agent-Orchestration-Architecture-v0.2.md` and the then-current MVP in
+`src/`. It revised iteration 1 to resolve OBJ-001 (read-model contract ordering)
+and OBJ-002 (gate compare-and-set primitive).
 
 ## 1. Context and Constraints
 

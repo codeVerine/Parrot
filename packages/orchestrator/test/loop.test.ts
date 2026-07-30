@@ -329,7 +329,7 @@ test("frontier re-invoke: restructured proposal with open objections dispatches 
     maxIterations: 3,
     onStalemate: () => "abort",
   });
-    assert.ok(frontierTurns >= 1, `expected at least 1 frontier turn, got ${frontierTurns} (churn may add more)`);
+  assert.ok(frontierTurns >= 1, `expected at least 1 frontier turn, got ${frontierTurns}`);
   // The mid-loop frontier at iteration 2 reported readiness "not_ready".
   // The post-gate frontier does not run here (iteration cap is reached on
   // iteration 3 with the same restructured headings), so the readiness the
@@ -708,28 +708,23 @@ test("notification: ordinary iteration cap emits exactly one iteration_cap notif
   assert.ok(req.openObjectionIds?.includes("OBJ-1"));
 });
 
-test("plan churn stops an A-B-A oscillation before the next reviewer turn", async () => {
-  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-plan-churn-"));
+test("churnDetection is deferred (no-op): A-B-A does not stop before the next reviewer turn", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-churn-deferred-"));
   const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
   const proposalA = [
     "# Plan",
     "## Execution",
     "- collect request evidence",
     "- validate the result",
-    "## Verification",
-    "1. run the tests",
-    "2. publish the report",
-  ].join("\\n");
+  ].join("\n");
   const proposalB = [
     "# Plan",
     "## Alternative",
     "- migrate the database",
     "- rewrite the transport",
-    "## Rollback",
-    "1. manual review",
-    "2. restore the snapshot",
-  ].join("\\n");
+  ].join("\n");
   const proposalTexts = [proposalA, proposalB, proposalA];
+
   let plannerIteration = 0;
   const reviewerIterations: string[] = [];
   const resolver = (req: AgentTurnRequest): string => {
@@ -761,7 +756,7 @@ test("plan churn stops an A-B-A oscillation before the next reviewer turn", asyn
       writeFileSync(req.resultPath, text, "utf8");
       return text;
     }
-    throw new Error(`unexpected turn after churn: ${req.turnType}`);
+    throw new Error(`unexpected turn after review loop: ${req.turnType}`);
   };
 
   let counter = 0;
@@ -771,20 +766,86 @@ test("plan churn stops an A-B-A oscillation before the next reviewer turn", asyn
     humanSink: createMemorySink(),
     runsRoot,
     writePrompts: false,
-    newId: () => `churn-turn-${++counter}`,
-    nonceFactory: () => "churn-nonce",
+    newId: () => `turn-${++counter}`,
+    nonceFactory: () => "nonce",
   });
 
   const result = await runReviewLoop(comp, {
     ...loopInput,
-    maxIterations: 5,
-    onStalemate: () => "abort",
+    maxIterations: 3,
+    churnDetection: { scoreFloor: 0, churnMargin: 0, disabled: false }, // currently ignored
   });
 
-  assert.equal(result.phase, "escalated");
-  assert.deepEqual(result.escalation, { reason: "plan_churn", objectionIds: ["OBJ-1"] });
-  assert.deepEqual(reviewerIterations, ["workflow-1-iter-1", "workflow-1-iter-2"]);
-  assert.ok(store.listEvents().some((entry) => entry.kind === "PlanChurnDetected"));
+  assert.equal(result.escalation, undefined);
+  assert.deepEqual(reviewerIterations, ["workflow-1-iter-1", "workflow-1-iter-2", "workflow-1-iter-3"]);
+  assert.ok(!store.listEvents().some((entry) => entry.kind === "PlanChurnDetected"));
+});
+
+test("churnDetection is deferred (no-op): A-A-A does not falsely trigger churn", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-churn-deferred-aaa-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  const proposalA = [
+    "# Plan",
+    "## Execution",
+    "- collect request evidence",
+    "- validate the result",
+  ].join("\n");
+  const proposalTexts = [proposalA, proposalA, proposalA];
+
+  let plannerIteration = 0;
+  const reviewerIterations: string[] = [];
+  const resolver = (req: AgentTurnRequest): string => {
+    if (req.turnType.startsWith("planner")) {
+      const index = plannerIteration++;
+      const proposalPath = join(runsRoot, `proposal-${index + 1}.md`);
+      writeFileSync(proposalPath, proposalTexts[index]!, "utf8");
+      const text = envelope(req, "planner", {
+        proposalPath,
+        summary: `proposal ${index + 1}`,
+        objectionsAddressed: [],
+      });
+      mkdirSync(dirname(req.resultPath), { recursive: true });
+      writeFileSync(req.resultPath, text, "utf8");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      reviewerIterations.push(req.iterationId);
+      const text = envelope(req, "reviewer", {
+        objections: [{ id: "OBJ-1", severity: "major", claim: "needs more evidence", evidence: ["plan.md:1"] }],
+      });
+      mkdirSync(dirname(req.resultPath), { recursive: true });
+      writeFileSync(req.resultPath, text, "utf8");
+      return text;
+    }
+    if (req.turnType === "frontier_report") {
+      const text = envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+      mkdirSync(dirname(req.resultPath), { recursive: true });
+      writeFileSync(req.resultPath, text, "utf8");
+      return text;
+    }
+    throw new Error(`unexpected turn after review loop: ${req.turnType}`);
+  };
+
+  let counter = 0;
+  const comp = createComposition({
+    store,
+    runner: createFixtureRunner(resolver),
+    humanSink: createMemorySink(),
+    runsRoot,
+    writePrompts: false,
+    newId: () => `turn-${++counter}`,
+    nonceFactory: () => "nonce",
+  });
+
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    maxIterations: 3,
+    churnDetection: { scoreFloor: 0, churnMargin: 0, disabled: false }, // currently ignored
+  });
+
+  assert.equal(result.escalation, undefined);
+  assert.deepEqual(reviewerIterations, ["workflow-1-iter-1", "workflow-1-iter-2", "workflow-1-iter-3"]);
+  assert.ok(!store.listEvents().some((entry) => entry.kind === "PlanChurnDetected"));
 });
 
 test("notification: blocking terminal frontier at iteration cap does not throw and emits exactly one notification", async () => {

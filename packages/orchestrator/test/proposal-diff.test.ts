@@ -65,10 +65,31 @@ test("weighted proposal similarity exposes structural components and weights ste
   assert.equal(score.simHeadings, 1);
   assert.equal(score.simSteps, 1);
   assert.ok(score.simAll > 0 && score.simAll < 1);
-  assert.equal(score.score, 0.5 * score.simSteps + 0.3 * score.simHeadings + 0.2 * score.simAll);
+  assert.equal(
+    score.score,
+    score.weights.steps * score.simSteps + score.weights.headings * score.simHeadings + score.weights.all * score.simAll,
+  );
+  assert.ok(Math.abs(score.weights.steps + score.weights.headings + score.weights.all - 1) < 1e-9);
+  assert.equal(score.used.headings, true);
+  assert.equal(score.used.steps, true);
 
   const changedSteps = weightedProposalSimilarity(a, b.replace("run the verifier", "rewrite the transport"));
   assert.ok(changedSteps.score < score.score);
+});
+
+test("weighted proposal similarity: prose-only proposals exclude missing structural weights", () => {
+  const a = "this is free-form prose without headings or list steps";
+  const b = "completely unrelated prose with different tokens and no structure";
+  const score = weightedProposalSimilarity(a, b);
+
+  // When both proposals are unstructured, the score should fall back to whole-document similarity.
+  assert.equal(score.used.headings, false);
+  assert.equal(score.used.steps, false);
+  assert.equal(score.weights.all, 1);
+  assert.equal(score.weights.headings, 0);
+  assert.equal(score.weights.steps, 0);
+  assert.equal(score.score, score.simAll);
+  assert.ok(score.score < 0.5);
 });
 
 test("sectionHeadings extracts and normalizes headings", () => {

@@ -10,13 +10,13 @@
     }
   },
   "bin": {
-    "parrot": "./dist/src/cli.js"
+    "parrot": "./bin/parrot.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "orchestrate": "tsx src/cli.ts",
-    "test": "pnpm --filter @platform/contracts build && pnpm --filter @platform/persistence build && pnpm --filter @platform/llm-boundary build && pnpm --filter @platform/workflow-engine build && pnpm --filter @platform/human-loop build && pnpm --filter @platform/herdr-adapter build && node --import tsx --test test/*.test.ts"
+    "test": "pnpm --filter @platform/contracts build && pnpm --filter @platform/persistence build && pnpm --filter @platform/llm-boundary build && pnpm --filter @platform/workflow-engine build && pnpm --filter @platform/human-loop build && pnpm --filter @platform/herdr-adapter build && pnpm run build && node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@platform/contracts": "workspace:*",

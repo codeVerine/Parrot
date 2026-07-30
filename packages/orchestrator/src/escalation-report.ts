@@ -111,19 +111,36 @@ export function buildChurnReport(
   margin: number,
   headings?: { added: string[]; removed: string[] },
   components?: {
-    previous: { simAll: number; simHeadings: number; simSteps: number; score: number };
-    prior: { simAll: number; simHeadings: number; simSteps: number; score: number };
+    previous: {
+      simAll: number;
+      simHeadings: number;
+      simSteps: number;
+      score: number;
+      weights?: { all: number; headings: number; steps: number };
+      used?: { headings: boolean; steps: boolean };
+    };
+    prior: {
+      simAll: number;
+      simHeadings: number;
+      simSteps: number;
+      score: number;
+      weights?: { all: number; headings: number; steps: number };
+      used?: { headings: boolean; steps: boolean };
+    };
   },
 ): string {
   const lines = [
     `Plan churn detected: iteration ${iterationNumber(toIterationId)} more similar to ${iterationNumber(fromIterationId)} than to its predecessor.`,
-    `sim(N, N-2): ${(similarity * 100).toFixed(1)}% (margin: ${(margin * 100).toFixed(0)}%)`,
+    `similarity: ${(similarity * 100).toFixed(1)}% (margin: ${(margin * 100).toFixed(0)}%)`,
     detail,
   ];
   if (components) {
+    const fmt = (value: number | undefined) => (value === undefined ? "-" : value.toFixed(3));
+    const weightsPrev = components.previous.weights;
+    const weightsPrior = components.prior.weights;
     lines.push(
-      `components (N,N-1): all=${components.previous.simAll.toFixed(3)}, headings=${components.previous.simHeadings.toFixed(3)}, steps=${components.previous.simSteps.toFixed(3)}, score=${components.previous.score.toFixed(3)}`,
-      `components (N,N-2): all=${components.prior.simAll.toFixed(3)}, headings=${components.prior.simHeadings.toFixed(3)}, steps=${components.prior.simSteps.toFixed(3)}, score=${components.prior.score.toFixed(3)}`,
+      `components (N,N-1): all=${components.previous.simAll.toFixed(3)}, headings=${components.previous.simHeadings.toFixed(3)} (w=${fmt(weightsPrev?.headings)}), steps=${components.previous.simSteps.toFixed(3)} (w=${fmt(weightsPrev?.steps)}), score=${components.previous.score.toFixed(3)}`,
+      `components (N,prior): all=${components.prior.simAll.toFixed(3)}, headings=${components.prior.simHeadings.toFixed(3)} (w=${fmt(weightsPrior?.headings)}), steps=${components.prior.simSteps.toFixed(3)} (w=${fmt(weightsPrior?.steps)}), score=${components.prior.score.toFixed(3)}`,
     );
   }
   if (headings) {

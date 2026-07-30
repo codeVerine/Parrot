@@ -35,6 +35,10 @@ export type WeightedProposalSimilarity = {
   simHeadings: number;
   simSteps: number;
   score: number;
+  /** Normalized weights applied to each component (sum to 1). */
+  weights: { all: number; headings: number; steps: number };
+  /** Which structural components were present on either side (both absent -> excluded). */
+  used: { headings: boolean; steps: boolean };
 };
 
 /**
@@ -44,13 +48,38 @@ export type WeightedProposalSimilarity = {
  */
 export function weightedProposalSimilarity(a: string, b: string): WeightedProposalSimilarity {
   const simAll = proposalSimilarity(a, b);
-  const simHeadings = proposalSimilarity(sectionHeadings(a).join("\n"), sectionHeadings(b).join("\n"));
-  const simSteps = proposalSimilarity(sectionSteps(a).join("\n"), sectionSteps(b).join("\n"));
+  const headingsA = sectionHeadings(a);
+  const headingsB = sectionHeadings(b);
+  const stepsA = sectionSteps(a);
+  const stepsB = sectionSteps(b);
+
+  // Exclude empty-vs-empty components; include any component present on either
+  // side so missing structure is penalized (sim=0) instead of silently ignored.
+  const useHeadings = headingsA.length > 0 || headingsB.length > 0;
+  const useSteps = stepsA.length > 0 || stepsB.length > 0;
+
+  const simHeadings = proposalSimilarity(headingsA.join("\n"), headingsB.join("\n"));
+  const simSteps = proposalSimilarity(stepsA.join("\n"), stepsB.join("\n"));
+
+  const base = { steps: 0.5, headings: 0.3, all: 0.2 };
+  const active = {
+    steps: useSteps ? base.steps : 0,
+    headings: useHeadings ? base.headings : 0,
+    all: base.all,
+  };
+  const total = active.steps + active.headings + active.all;
+  const weights = {
+    steps: active.steps / total,
+    headings: active.headings / total,
+    all: active.all / total,
+  };
   return {
     simAll,
     simHeadings,
     simSteps,
-    score: 0.5 * simSteps + 0.3 * simHeadings + 0.2 * simAll,
+    score: weights.steps * simSteps + weights.headings * simHeadings + weights.all * simAll,
+    weights,
+    used: { headings: useHeadings, steps: useSteps },
   };
 }
 

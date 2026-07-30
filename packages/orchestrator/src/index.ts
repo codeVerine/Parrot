@@ -27,6 +27,10 @@ export {
   type HerdrRunnerOptions,
 } from "./herdr-runner.js";
 export {
+  findStoredAgentSession,
+  workflowRoleAgentKey,
+} from "./agent-session.js";
+export {
   runReviewLoop,
   type HumanDecision,
   type HumanDecisionResolver,

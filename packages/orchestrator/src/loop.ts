@@ -3,12 +3,10 @@ import { blockingFindings, escalationAttention, findingsFromReport, frontierFail
 import type { CodebaseContextFile, ObjectionView } from "@platform/llm-boundary";
 import { stalemateObjectionIds, type FoldedState, type WorkflowEngineConfig, type WorkflowPhase } from "@platform/workflow-engine";
 import type { Composition } from "./composition.js";
-import { buildChurnReport, buildStalemateReport } from "./escalation-report.js";
+import { buildStalemateReport } from "./escalation-report.js";
 import {
-  addedRemovedHeadings,
   isMajorRestructuring,
   loadProposalAtIteration,
-  weightedProposalSimilarity,
 } from "./proposal-diff.js";
 import type { ResumeSeed } from "./resume.js";
 import { readFileSync } from "node:fs";
@@ -63,7 +61,14 @@ export type ReviewLoopInput = {
     headingChangeRatio?: number;
     similarityFloor?: number;
   };
-  /** Detect a high-signal proposal reversion (N -> N-2) before another review round. */
+  /**
+   * Reserved for a future churn detection heuristic.
+   *
+   * Churn detection is intentionally **deferred**: similarity-based heuristics
+   * have not yet separated the motivating reversion from ordinary revisions on
+   * real proposals. This config is accepted as a **no-op** so callers passing
+   * legacy config do not fail validation.
+   */
   churnDetection?: {
     scoreFloor?: number;
     churnMargin?: number;
@@ -113,9 +118,6 @@ export async function runReviewLoop(
   // should fire (set threshold at 0.7 so 0.765 clears it).
   const frontierHeadingChangeRatio = input.frontierReinvoke?.headingChangeRatio ?? 0.7;
   const frontierSimilarityFloor = input.frontierReinvoke?.similarityFloor ?? 0.4;
-  const churnScoreFloor = input.churnDetection?.scoreFloor ?? 0.65;
-  const churnMargin = input.churnDetection?.churnMargin ?? 0;
-  const churnDetectionDisabled = input.churnDetection?.disabled === true;
 
   if (!input.resume) {
     comp.startWorkflow({
@@ -307,55 +309,10 @@ export async function runReviewLoop(
           break;
         }
 
-        // Detect a high-signal A -> B -> A reversion before dispatching any
-        // reviewer/frontier turn for the reverted proposal. Both historical
-        // proposals must be durable, completed planner artifacts; a missing
-        // artifact simply means there is not enough evidence to escalate.
-        if (iteration >= 3 && !churnDetectionDisabled && finalProposalPath) {
-          const currentText = readProposalTextOrNull(finalProposalPath);
-          const previous = loadProposalAtIteration(comp.store, workflowId, iteration - 1);
-          const prior = loadProposalAtIteration(comp.store, workflowId, iteration - 2);
-          if (currentText !== null && previous && prior) {
-            const scorePrev = weightedProposalSimilarity(currentText, previous.text);
-            const scorePrior = weightedProposalSimilarity(currentText, prior.text);
-            if (
-              scorePrior.score >= churnScoreFloor &&
-              scorePrior.score >= scorePrev.score + churnMargin
-            ) {
-              const fromIterationId = `${workflowId}-iter-${iteration - 2}`;
-              const toIterationId = `${workflowId}-iter-${iteration}`;
-              const headingDelta = addedRemovedHeadings(prior.text, currentText);
-              const detail = [
-                `component similarity: all=${scorePrior.simAll.toFixed(3)}, headings=${scorePrior.simHeadings.toFixed(3)}, steps=${scorePrior.simSteps.toFixed(3)}`,
-                `weighted score: prior=${scorePrior.score.toFixed(3)}, previous=${scorePrev.score.toFixed(3)}, floor=${churnScoreFloor.toFixed(3)}`,
-              ].join("; ");
-              const report = buildChurnReport(
-                fromIterationId,
-                toIterationId,
-                scorePrior.score,
-                detail,
-                churnMargin,
-                headingDelta,
-                { previous: scorePrev, prior: scorePrior },
-              );
-              const openObjectionIds = openIds();
-              engine.reportPlanChurn({
-                workflowId,
-                fromIterationId,
-                toIterationId,
-                similarity: scorePrior.score,
-                detail,
-                iterationId,
-                turnId: planner.turnId,
-                agentId: input.plannerAgentId,
-                notify: false,
-              });
-              const outcome = await resolveEscalation("plan_churn", openObjectionIds, report);
-              if (outcome !== "continue") return outcome;
-              break;
-            }
-          }
-        }
+        // Plan churn detection is intentionally deferred. See the comment on
+        // ReviewLoopInput.churnDetection and the Phase 12 doc. The integration
+        // slot is kept here so a future heuristic can plug in without reshaping
+        // the planner->reviewer transition.
 
         // Resolve only objections that are not already resolved. Skip legacy
         // bare-ID addressals: a pre-Phase-10 result.toon rehydrated via

@@ -1,11 +1,15 @@
 # Phase 12: Proposal-Diff Signal and Frontier Re-invoke
 
-**Status: implemented**
+**Status: implemented (churn detection deferred)**
 
 Phase 12 builds the shared proposal-diff signal and the loop rules that
-consume it. Churn detection compares high-signal headings and execution
-steps against the previous two planner proposals; frontier re-invoke uses
-the same proposal diff to scrutinize major restructurings.
+consume it. The **frontier re-invoke** rule ships: it re-runs the frontier
+mid-loop when the planner makes a major restructuring while objections
+remain open. The originally proposed **churn detection** rule is
+intentionally **deferred**: deterministic similarity metrics did not
+separate the motivating reversion from ordinary revisions on real
+proposals, so wiring a false-positive-prone alarm into the loop would cost
+runs.
 
 It adds **one new platform event kind** (`PlanChurnDetected`) and **no
 SQL migration**. V2 sections: 6.3, 6.6, 6.7.
@@ -35,9 +39,9 @@ proposal-diff signal for future loop rules.
 - No engine-side file access. The workflow engine stays pure: the
   loop detects, the engine records - the same split Phase 10 used
   for `GuardrailConflict`.
-- No semantic or LLM-based diff. The deterministic weighted score is
-  intentionally conservative and configurable; the human remains the
-  authority on a reported churn alarm.
+- No semantic or LLM-based diff. The deterministic signals are
+  intentionally conservative and configurable; if churn detection is
+  re-enabled, the human remains the authority on a reported alarm.
 
 ## 2. The Proposal-Diff Signal
 
@@ -47,7 +51,7 @@ New orchestrator module `proposal-diff.ts`:
 proposalSimilarity(a: string, b: string): number
 sectionHeadings(text: string): string[]
 sectionSteps(text: string): string[]
-weightedProposalSimilarity(a: string, b: string): { simAll, simHeadings, simSteps, score }
+weightedProposalSimilarity(a: string, b: string): { simAll, simHeadings, simSteps, score, weights, used }
 isMajorRestructuring(prev: string, next: string, opts?): boolean
 loadProposalAtIteration(store, workflowId, iteration): Snapshot | null
 addedRemovedHeadings(prev: string, next: string): { added: string[]; removed: string[] }
@@ -63,7 +67,10 @@ weighted signal also computes `simHeadings` from `sectionHeadings` and
 `^\\s*([-*+]|(\\d+\\.))\\s+`:
 
 ```text
-score = 0.5 * simSteps + 0.3 * simHeadings + 0.2 * simAll
+base weights: steps=0.5, headings=0.3, all=0.2
+exclude a component when it is empty on both sides
+renormalize remaining weights to sum to 1
+score = w_steps*simSteps + w_headings*simHeadings + w_all*simAll
 ```
 
 ### 2.2 Restructuring predicate
@@ -81,7 +88,7 @@ detected as either:
   `similarityFloor` (default `0.4`) even when headings survive.
 
 Either condition fires the predicate. `sectionHeadings` returns
-`null` (treated as "no headings") when neither side has any, so the
+`[]` when neither side has any, so the
 similarity floor is the only signal in that case.
 
 ### 2.3 Proposal lookup
@@ -97,40 +104,24 @@ current iteration's proposal is already in loop scratch
 (`finalProposalPath`); only N-1 goes through the store, so fresh and
 resumed runs behave identically.
 
-## 3. Rule 1: Churn Detection
+## 3. Rule 1: Churn Detection (Deferred)
 
-### 3.1 Trigger
+The churn detector was designed to halt a loop that is oscillating between
+two approaches (e.g. A → B → A). In practice, deterministic similarity
+metrics did not cleanly separate the motivating reversion from legitimate
+iteration-to-iteration drift on real proposals, so the loop integration is
+**disabled** for now.
 
-In the loop's `planner_turn` step, after a valid planner result at
-`iteration >= 3`, load the completed planner proposals at N-1 and N-2
-and read the current proposal. Compute the weighted score for both
-pairs. Churn fires when `score(N,N-2) >= scoreFloor` (default `0.65`)
-and `score(N,N-2) >= score(N,N-1) + churnMargin` (default `0.0`). The
-`churnDetection.disabled` switch is respected.
+What ships today:
 
-### 3.2 Implementation
+- The `PlanChurnDetected` event kind and `engine.reportPlanChurn(...)` method.
+- The `buildChurnReport(...)` formatter for human review.
+- The `ReviewLoopInput.churnDetection` config field as a **no-op** stub (so
+  callers passing legacy config do not fail validation).
 
-The loop records `PlanChurnDetected` through
-`engine.reportPlanChurn({ notify: false, ... })`, then builds a human
-report containing all component scores and the added/removed heading
-delta. The existing `onStalemate` callback receives reason `plan_churn`.
-The choices apply an approved mitigation with `waiveOpenObjections`,
-reject the objection, or abort with a configured escalation attention
-request.
-
-### 3.3 Loop integration
-
-The check runs before reviewers or frontier turns for N, so a genuine
-A -> B -> A oscillation stops early. Missing or invalid proposal artifacts
-are treated as no signal and never crash the loop. The integration test
-writes A, B, A proposals, asserts `plan_churn`, verifies that no reviewer
-turn runs for N, and checks the durable `PlanChurnDetected` event.
-
-### 3.4 Conservative behavior
-
-The absolute floor plus relative advantage avoids escalating ordinary
-vocabulary drift. Operators can raise the floor or margin, or disable the
-rule, if production proposals show legitimate revisions being flagged.
+A future phase can re-enable this rule once a heuristic is validated on real
+corpora (e.g. section-weighted similarity, longer-period oscillation
+detection, or structure-aware hashing).
 
 ## 4. Rule 2: Frontier Re-invoke
 
@@ -172,15 +163,13 @@ iteration, only on restructuring iterations with an ongoing debate.
 
 ### 4.3 Interaction with churn detection
 
-A revert of N to N-2 is also a large N-1 -> N change, so both
-rules could match the same iteration. They never both fire: the
-churn check runs in `planner_turn` and escalates before any
-reviewer or frontier turn is dispatched for that iteration.
+Churn detection is currently deferred, so there is no interaction: only the
+frontier re-invoke rule is active.
 
 ### 4.4 Corpus calibration
 
 Defaults are calibrated against the motivating run's three
-consecutive pairs (N-1 -> N) as measured by the weighted score and
+consecutive pairs (N-1 -> N) as measured by `proposalSimilarity` and
 `headingChangeRatio` on the actual proposal text:
 
 | Pair | sim | hcr | Fires? | Why |
@@ -206,9 +195,7 @@ two borderline cases.
 | `ReviewLoopInput.frontierReinvoke.headingChangeRatio` | `0.7` | Heading-set turnover that triggers a mid-loop frontier. |
 | `ReviewLoopInput.frontierReinvoke.similarityFloor` | `0.4` | Document similarity below this triggers a mid-loop frontier. |
 | `ReviewLoopInput.frontierReinvoke.disabled` | off | Skips the mid-loop frontier rule. |
-| `ReviewLoopInput.churnDetection.scoreFloor` | `0.65` | Minimum weighted N vs N-2 similarity required to alarm. |
-| `ReviewLoopInput.churnDetection.churnMargin` | `0.0` | Required advantage of N vs N-2 over N vs N-1. |
-| `ReviewLoopInput.churnDetection.disabled` | off | Disables the churn check. |
+| `ReviewLoopInput.churnDetection.*` | n/a | Reserved. Currently a no-op stub; churn detection is deferred. |
 | `escalationNotificationTarget` | existing | Reused; the loop emits notifications for guardrail conflict and objection stalemate at abort time (see section 6). |
 
 No environment variables. Configuration is per-run via
@@ -221,8 +208,7 @@ Three engine entry points can produce an `escalation` or `escalated`
 notification:
 
 - `reportGuardrailConflict({ notify: false })` (engine method).
-- `reportPlanChurn({ notify: false })` (engine method used by the
-  planner-turn churn check).
+- `reportPlanChurn({ notify: false })` (engine method; currently unused by the loop).
 - `engine.advancePlanning(workflowId, "evaluateObjectionGate", { notify: false })`
   (the gate itself, covering both `ObjectionStalemate` and
   `IterationCapReached`).
@@ -231,9 +217,11 @@ All three accept an optional `notify: boolean` parameter. When
 `false`, the engine commits the event and the workflow state but
 suppresses the `notifyEscalation` side effect.
 
-The review loop passes `notify: false` to all three and emits the
-notification itself via `comp.humanSink.notify` only when the
-resolver returns `"abort"`. The re-emit uses
+The review loop passes `notify: false` to guardrail-conflict reporting and the
+objection gate. The plan-churn entry point is retained for future callers but is
+not invoked by the loop while churn detection is deferred. For active loop
+escalations, the loop emits the notification itself via
+`comp.humanSink.notify` only when the resolver returns `"abort"`. The re-emit uses
 `escalationAttention(workflowId, config, reason, objectionIds)` from
 `@platform/human-loop` so the request has the configured
 `dashboardDeepLinkBase`, the `escalation` kind, the reason as
@@ -251,19 +239,16 @@ escalation.
 
 ## 7. Assigned Open Questions
 
-- **"Keep iterating" choice.** A false-positive churn alarm
-  currently costs the run: the human must abort and start fresh. A
+- **"Keep iterating" choice.** If churn detection is re-enabled, a false-positive
+  churn alarm would cost the run: the human must abort and start fresh. A
   fourth resolver choice that un-escalates back to `planner_turn`
   needs a new engine method (escalated is terminal today);
   deferred until a false positive is observed.
-- **Period > 2 oscillation.** Comparing N against every prior
-  iteration and taking the max similarity would catch 3-cycle
-  orbits; deferred - the observed failure was period-2 and the
-  N-2 rule catches it (in the synthetic corpus; see 3.4 for the
-  real-run limit).
-- **False-positive calibration.** Tune the score floor and margin if
-  production runs show legitimate revisions being flagged; the defaults
-  remain conservative until that evidence exists.
+- **Period > 2 oscillation.** If/when churn detection is re-enabled, comparing
+  N against every prior iteration and taking the max similarity would catch
+  3-cycle orbits.
+- **False-positive calibration.** If/when churn detection is re-enabled, tune
+  any floor/margin against real corpora before wiring an alarm into the loop.
 - **Resume-time `lastFrontierIteration`.** The scratch is
   in-memory; a resume can re-run one frontier turn at the current
   iteration. Harmless (objection IDs embed the turn ID, so
@@ -292,4 +277,4 @@ escalation.
 - Frontier scrutiny of restructured plans while the debate is
   still live, at bounded cost.
 - The `PlanChurnDetected` event and `engine.reportPlanChurn` method,
-  wired to the planner-turn churn check.
+  ready for a future churn heuristic (the loop does not wire it today).
