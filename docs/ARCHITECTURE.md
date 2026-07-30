@@ -8,9 +8,8 @@ transitions; model-backed agents only perform semantic work through
 schema-validated turn artifacts. SQLite and the append-only event log are the
 durable source of truth.
 
-The packaged runtime is assembled by `@platform/orchestrator`. The root `src/`
-tree is a retained compatibility implementation and is not part of the package
-architecture described below.
+The packaged runtime is assembled by `@platform/orchestrator`, the single
+composition root. Every source file lives in a workspace package.
 
 ## Components
 
@@ -89,9 +88,10 @@ valid; otherwise the turn is re-dispatched through the normal bounded path.
 
 ## Agent and filesystem isolation
 
-Role panes are created lazily in a dedicated Herdr tab. Stored session metadata
-is scoped by workflow and role, which prevents one workflow from attaching to
-another workflow's provider session.
+Role panes are created lazily in a dedicated Herdr tab. Herdr pane names and
+stored session metadata are scoped by workflow and role, which prevents one
+workflow from colliding with or attaching to another workflow's provider
+session.
 
 Planner, reviewer, and frontier roles run in the target checkout. Implementation
 and verifier roles run in the same workflow-specific git worktree. The worktree
@@ -128,7 +128,6 @@ configuration, and workflow configuration resolver.
 - `approved-plans/` preserves accepted planning artifacts for audit.
 - `runs/` contains local runtime state and is git-ignored.
 - `scripts/` contains operator utilities such as review-bundle generation.
-- `src/` is the pre-package compatibility stack pending gated retirement.
 
 See [Configuration](CONFIGURATION.md) for defaults and
 [Testing](TESTING.md) for package-level verification.

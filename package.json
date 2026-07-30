@@ -6,19 +6,9 @@
   "packageManager": "pnpm@10.13.1",
   "scripts": {
     "orchestrate": "pnpm --filter @platform/orchestrator orchestrate",
-    "orchestrate:legacy": "tsx src/orchestrate.ts",
     "parrot": "pnpm --filter @platform/orchestrator exec tsx src/cli.ts",
     "build": "pnpm -r run build",
-    "typecheck": "pnpm run build && pnpm -r run typecheck && tsc --noEmit",
+    "typecheck": "pnpm run build && pnpm -r run typecheck",
     "test": "pnpm -r run test"
-  },
-  "dependencies": {
-    "@platform/contracts": "workspace:*",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@types/node": "^22.9.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
   }
 }

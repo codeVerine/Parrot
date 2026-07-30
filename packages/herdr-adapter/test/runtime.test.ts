@@ -31,6 +31,83 @@ test("runtime correlates delivery, result hash, and result-file signal", async (
   const result = await runtime.result(handle.id, id); assert.equal(result.hash.length, 64); assert.equal(result.turnId, id); await runtime.close();
 });
 
+test("runtime waits for a newly spawned agent to become ready", async () => {
+  const fake = new FakeHerdr();
+  fake.startStatus = "unknown";
+  fake.readyAfterListCalls = 2;
+  const runtime = new HerdrAgentRuntime({
+    client: fake,
+    config: { operationTimeoutMs: 100, pollIntervalMs: 5 },
+  });
+
+  const handle = await runtime.start({
+    id: agentId("agent-starting"),
+    provider: "claude",
+    role: "planner",
+    workspaceId: "workspace-1",
+    worktreeRequired: false,
+  });
+
+  assert.equal(fake.listAgentCalls, 2);
+  assert.equal(runtime.identity.get(handle.id)?.status, "idle");
+  await runtime.close();
+});
+
+test("runtime attaches an existing persisted pane without spawning another", async () => {
+  const fake = new FakeHerdr();
+  const raw = await fake.startAgent({
+    name: "claude-planner",
+    argv: ["claude"],
+    workspace_id: "workspace-1",
+  }, 100);
+  const runtime = new HerdrAgentRuntime({
+    client: fake,
+    config: { operationTimeoutMs: 100, pollIntervalMs: 5 },
+  });
+
+  const handle = await runtime.attach({
+    id: agentId("workflow-1:planner"),
+    paneId: raw.pane_id,
+    provider: "claude",
+    role: "planner",
+    workspaceId: "workspace-1",
+    worktreeRequired: false,
+  });
+
+  assert.equal(handle?.paneId, raw.pane_id);
+  assert.equal(fake.agents.size, 1);
+  assert.equal(runtime.identity.get(agentId("workflow-1:planner"))?.status, "idle");
+  await runtime.close();
+});
+
+test("runtime immediately reattaches a persisted pane that is still working", async () => {
+  const fake = new FakeHerdr();
+  fake.startStatus = "working";
+  const raw = await fake.startAgent({
+    name: "claude-planner",
+    argv: ["claude"],
+    workspace_id: "workspace-1",
+  }, 100);
+  const runtime = new HerdrAgentRuntime({
+    client: fake,
+    config: { operationTimeoutMs: 20, pollIntervalMs: 5 },
+  });
+
+  const handle = await runtime.attach({
+    id: agentId("workflow-1:planner"),
+    paneId: raw.pane_id,
+    provider: "claude",
+    role: "planner",
+    workspaceId: "workspace-1",
+    worktreeRequired: false,
+  });
+
+  assert.equal(handle?.paneId, raw.pane_id);
+  assert.equal(fake.listAgentCalls, 1);
+  assert.equal(runtime.identity.get(agentId("workflow-1:planner"))?.status, "working");
+  await runtime.close();
+});
+
 test("onStatus receives normalized live Herdr status", async () => {
   const fake = new FakeHerdr(); const runtime = new HerdrAgentRuntime({ client: fake, config: { operationTimeoutMs: 100 } });
   const handle = await runtime.start({ id: agentId("agent-status"), provider: "codex", role: "reviewer", workspaceId: "workspace-1", worktreeRequired: false });

@@ -41,10 +41,10 @@ Start Herdr:
 herdr
 ```
 
-From this repository, run the included task file:
+From this repository, pass a task as text or point to your own task file:
 
 ```bash
-pnpm parrot task.md
+pnpm parrot "Describe the change you want to plan and implement."
 ```
 
 For another project, either install the global command:
@@ -104,7 +104,7 @@ authoritative.
 Start `herdr`, or select a non-default socket:
 
 ```bash
-HERDR_SOCKET=/path/to/herdr.sock pnpm parrot task.md
+HERDR_SOCKET=/path/to/herdr.sock pnpm parrot "Describe the change."
 ```
 
 Use `herdr status server` to find the active socket.
@@ -114,7 +114,7 @@ Use `herdr status server` to find the active socket.
 Focus the desired workspace in Herdr or set its ID:
 
 ```bash
-PARROT_WORKSPACE=<workspace-id> pnpm parrot task.md
+PARROT_WORKSPACE=<workspace-id> pnpm parrot "Describe the change."
 ```
 
 ### Global command imports missing build output
@@ -133,7 +133,7 @@ worktree that belongs to another repository/branch. Remove or relocate that
 specific stale directory, or choose another root:
 
 ```bash
-PARROT_WORKTREE_ROOT=/absolute/clean/path parrot task.md
+PARROT_WORKTREE_ROOT=/absolute/clean/path parrot /path/to/task.md
 ```
 
 ### Package-manager signature verification fails

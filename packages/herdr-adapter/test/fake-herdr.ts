@@ -15,6 +15,9 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   failStart = false;
   failSnapshot = false;
   missingIntegrations: string[] = [];
+  startStatus: HerdrAgent["agent_status"] = "idle";
+  readyAfterListCalls = 0;
+  listAgentCalls = 0;
   /** Deterministic pane read text and revision per pane. */
   readonly paneTexts = new Map<string, string>();
   private paneRevisions = new Map<string, number>();
@@ -36,7 +39,7 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   async startAgent(spec: AgentStartSpec, _timeoutMs: number): Promise<HerdrAgent> {
     if (this.failStart) throw new Error("fake spawn failed");
     const provider = spec.argv[0] ?? spec.name;
-    const agent: HerdrAgent = { pane_id: `pane-${++this.paneCounter}`, workspace_id: spec.workspace_id ?? "workspace-1", agent: provider, name: spec.name, agent_status: "idle", agent_session_id: `session-${this.paneCounter}`, agent_session_path: `/tmp/session-${this.paneCounter}` };
+    const agent: HerdrAgent = { pane_id: `pane-${++this.paneCounter}`, workspace_id: spec.workspace_id ?? "workspace-1", agent: provider, name: spec.name, agent_status: this.startStatus, agent_session_id: `session-${this.paneCounter}`, agent_session_path: `/tmp/session-${this.paneCounter}` };
     this.agents.set(agent.pane_id, agent); return agent;
   }
   async sendAgent(target: string, text: string, _verificationMarker: string, _timeoutMs: number, _cli?: HerdrCli): Promise<void> {
@@ -68,7 +71,16 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   async interruptAgent(_paneId: string, _timeoutMs: number) {}
   async stopAgent(_paneId: string, _timeoutMs: number) {}
   async sessionSnapshot(_timeoutMs: number): Promise<HerdrSnapshot> { if (this.failSnapshot) throw new Error("snapshot failed"); return { protocol: 16, workspace_id: "workspace-1", agents: [...this.agents.values()] }; }
-  async listAgents(_timeoutMs: number) { if (this.failSnapshot) throw new Error("list failed"); return [...this.agents.values()]; }
+  async listAgents(_timeoutMs: number) {
+    if (this.failSnapshot) throw new Error("list failed");
+    this.listAgentCalls += 1;
+    if (this.readyAfterListCalls > 0 && this.listAgentCalls >= this.readyAfterListCalls) {
+      for (const agent of this.agents.values()) {
+        if (agent.agent_status === "unknown") agent.agent_status = "idle";
+      }
+    }
+    return [...this.agents.values()];
+  }
   async subscribeAgentStatus(paneId: string, _timeoutMs: number) { this.subscribedPanes.push(paneId); }
   onEvent(listener: (event: HerdrEvent) => void) { this.subscribers.add(listener); return () => { this.subscribers.delete(listener); }; }
   close() { this.subscribers.clear(); }

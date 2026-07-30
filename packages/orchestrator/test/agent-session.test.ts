@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PersistenceStore } from "@platform/persistence";
-import { findStoredAgentSession, workflowRoleAgentKey } from "../src/agent-session.js";
+import {
+  findStoredAgent,
+  findStoredAgentSession,
+  workflowRoleAgentKey,
+  workflowRoleAgentName,
+} from "../src/agent-session.js";
+
+test("workflow role agent names are Herdr-safe and workflow-scoped", () => {
+  const first = workflowRoleAgentName("wf/a", "claude", "planner");
+  const second = workflowRoleAgentName("wf_a", "claude", "planner");
+
+  assert.match(first, /^claude-planner-[a-f0-9]{10}$/);
+  assert.match(second, /^claude-planner-[a-f0-9]{10}$/);
+  assert.notEqual(first, second);
+});
 
 test("findStoredAgentSession scopes provider sessions by workflow and role", () => {
   const store = new PersistenceStore({ path: ":memory:" });
@@ -31,6 +45,13 @@ test("findStoredAgentSession scopes provider sessions by workflow and role", () 
   assert.deepEqual(
     findStoredAgentSession(store, "wf-1", "planner", "claude", workspaceId),
     { sessionId: "sess-1", sessionPath: null },
+  );
+  assert.deepEqual(
+    findStoredAgent(store, "wf-1", "planner", "claude", workspaceId),
+    {
+      paneId: "pane-1",
+      resume: { sessionId: "sess-1", sessionPath: null },
+    },
   );
   assert.deepEqual(
     findStoredAgentSession(store, "wf-2", "planner", "claude", workspaceId),

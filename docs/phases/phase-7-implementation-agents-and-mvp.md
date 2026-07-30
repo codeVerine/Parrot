@@ -1,20 +1,20 @@
 # Phase 7: Implementation Agents and MVP
 
-**Status: implemented (packaged MVP; legacy root retirement pending)**
+**Status: implemented**
 
 Phase 7 closes the V2 MVP loop. After a human approves a plan, the approved
 work is routed to isolated implementation agents, their structured results and
 deviation requests are collected through the same turn protocol as review, and
 the human retains approval and audit control. The workspace composition root is
-shipped. The phase 1-2 era root `src/` implementation is still retained behind
-`pnpm orchestrate:legacy`; its deletion remains the separate parity-gated task
-in `task.md`.
+shipped, and the phase 1-2 era root implementation has been retired: every
+source file now lives in a workspace package.
 
-It depends on Phases 1 through 6. It introduces **no new platform event kinds**
-and **no new role-result schemas**: `ImplementationResultSchema` and the
-`ImplementationBlocked` event already exist in Phase 1, and the `implementation`
-and `resolution_verification` turn types already exist in the Phase 5 registry.
-V2 sections: 7 and 8.
+It depends on Phases 1 through 6. The implementation flow uses the Phase 1
+`ImplementationResultSchema` and `ImplementationBlocked` event, Phase 5
+`implementation` and `resolution_verification` turn types, and Phase 7's
+approved `VerificationCompleted` event. The legacy-retirement work added no
+event kind or role-result schema. The engine remains the sole platform-event
+writer. V2 sections: 7 and 8.
 
 Packages consume:
 
@@ -36,17 +36,17 @@ Packages consume:
 **Goal.** Two deliverables that finish the MVP:
 
 1. **Composition root** - one workspace package that owns the end-to-end run,
-   wiring engine, LLM boundary, human loop, and runtime adapter. It is the
-   current implementation; the parallel root stack remains compatibility-only
-   until its retirement gate is satisfied.
+   wiring engine, LLM boundary, human loop, and runtime adapter. It is the sole
+   implementation; the parallel root stack has been retired.
 2. **Implementation agents** - route an approved plan to isolated agents, drive
    the implementation turn, collect `ImplementationResult` (completed or
-   blocked) and deviation requests, and hand control back to the human with
-   full audit links.
+   blocked) and deviation requests, and preserve the result and verification
+   evidence in the durable run record.
 
 **Non-goals.**
 
-- No new event kinds or role-result schemas (both already exist in Phase 1).
+- No event-catalog change beyond Phase 7's approved additive
+  `VerificationCompleted` event, and no new role-result schema.
 - No new LLM-boundary machinery (reuses Phase 5 turn protocol end to end).
 - No dashboard orchestration logic (audit surface reuses Phase 6 projections).
 - No provider-specific implementation tuning beyond the config seam in section 7
@@ -54,47 +54,49 @@ Packages consume:
 
 ## 2. Composition Root Migration
 
-source: repo shape decision; package migration shipped, deletion still gated
+source: repo shape decision; package migration shipped, legacy root retired
 
 ### 2.1 Direction
 
-Root `src/` remains a phase 1-2 era orchestrator with its own duplicate schemas
-(`src/schemas.ts`), its own Herdr shim (`src/herdr.ts`), its own human gate
-(`src/gate.ts`), and its own prompt assembly (`src/prompts.ts`). Six of its
-seven files are reimplementations of what the `@platform/*` packages now own,
-and `orchestrate.ts` imports only its own modules plus `@platform/contracts`.
-It is a parallel compatibility stack, not a partial package.
+The former root stack was a phase 1-2 era orchestrator with its own duplicate
+schemas, Herdr shim, human gate, and prompt assembly. Six of its seven files
+reimplemented what the `@platform/*` packages now own. It was a parallel
+compatibility stack, not a partial package, and has been deleted.
 
 The MVP composition lives in **`@platform/orchestrator`** under
 `packages/orchestrator`, built against the real seams. The root `orchestrate`
-and `parrot` scripts select that package. Legacy `src/` is deleted only after
-the live parity gate in `task.md`; until then, the root typecheck and explicit
-`orchestrate:legacy` command keep its compatibility path honest.
+and `parrot` scripts select that package, which is now the single composition
+root.
 
 ### 2.2 Migrate-then-delete sequencing
 
-The package is the current runnable end-to-end MVP. Retirement sequencing is:
+The package is the runnable end-to-end MVP. Retirement sequencing was:
 
 1. Build `packages/orchestrator` against `@platform/*` and cover the packaged
    loop with deterministic tests. **Done.**
 2. Move `pnpm orchestrate` to the package and add the `parrot` development and
    compiled bin entrypoints. **Done.**
 3. Confirm live Herdr loop parity, then delete root `src/`, remove
-   `orchestrate:legacy`, and drop the root-only typecheck/dependencies.
-   **Pending approval.**
+   the legacy command, and drop the root-only typecheck/dependencies. **Done**
+   (parity asserted at the `wf-phase7-final-20260730` final human gate; that
+   approval authorized the deletion).
 
 ### 2.3 Salvage before delete
 
-Read, do not port: mine `src/orchestrate.ts` for the loop **order** and gate
-placement, and `src/registry.ts` for `agent_session_path` wiring. The
-sequencing knowledge is the value; the code is superseded.
+Before deletion the salvage step read the old loop for its **order** and gate
+placement and the old registry for `agent_session_path` wiring, and confirmed
+each is already represented in the package (`runReviewLoop` in
+`packages/orchestrator/src/loop.ts`; the `agent_session_path` fold in the
+herdr-adapter `IdentityMap`). No code was ported.
 
 ### 2.4 Composition responsibilities
 
 The orchestrator package is wiring only. It constructs the engine, the LLM
-boundary, the human-loop sinks and dashboard API, and the Herdr adapter, then
-drives the turn protocol. It writes **no** platform events directly (the engine
-stays the sole writer) and holds **no** business rules that belong in a package.
+boundary, human-loop notification sinks, and the Herdr adapter, then drives the
+turn protocol. The dashboard API remains an embeddable `@platform/human-loop`
+library surface. The orchestrator writes **no** platform events directly (the
+engine stays the sole writer) and holds **no** business rules that belong in a
+package.
 
 ## 3. Implementation Agents
 
@@ -103,8 +105,9 @@ source: V2 sections 7 and 8
 ### 3.1 Placement and trigger
 
 The implementation workflow starts on `HumanApproved` for a plan (Phase 4
-`approved` / Phase 6 approval surface). The approved plan and its provenance
-(objection history, decisions, frontier report) are the implementation input.
+`approved` / Phase 6 approval surface). The task and final approved proposal
+path are the implementation input; objection, decision, and frontier provenance
+remain available in the durable workflow record.
 
 ### 3.2 Isolation
 
@@ -137,44 +140,44 @@ Standard turn protocol via Phase 5, identical to review:
   escalates to the human (never a silent stop), reusing the Phase 6
   `NotificationSink` / `frontier_failed`-style attention surface.
 - A `deviationRequest` is a structured request to change the approved plan. It
-  does not let the agent self-authorize: it routes back to the human decision
-  surface (Phase 6 `humanDecision`) as a fresh approval, preserving the "human
-  authorizes plan changes" invariant.
+  does not let the agent self-authorize: it emits the same
+  `ImplementationBlocked` escalation, notifies the human, and is printed by the
+  CLI for an explicit follow-up decision.
 
 ### 3.5 Cost and health parity
 
-Implementation agents feed the Phase 6 cost ledger identically: session logs are
-found via `agent_session_path`, parsed by the versioned provider adapters, and
-submitted through `submitUsage`. Health metrics (wall clock, retries, repairs,
-timeouts, startup) cover implementation turns with the same code path as review.
+Implementation panes persist `agent_session_path` through the same identity map
+as review panes. Phase 6's provider adapters, `submitUsage` seam, and health
+projection therefore accept implementation turns without a separate Phase 7
+schema or ledger. Automatic session-log ingestion remains an embedding concern;
+the packaged CLI does not start a ledger poller.
 
 ## 4. Verification
 
 source: V2 section 8; Phase 5 `resolution_verification` turn type
 
 Completed implementation results are verified through the existing
-`resolution_verification` turn type before the human sees a ready state, so a
-claimed completion is checked rather than trusted. Verification failure follows
-the same bounded-repair-then-escalate path as any other turn. Verification is
-structured (result files remain the canonical contract), never a prose read.
-The verifier runs in the implementation worktree and receives its git branch,
-HEAD, porcelain status, changed-file list, and diff statistics as evidence.
+`resolution_verification` turn type, so a claimed completion is checked rather
+than trusted. Verification failure follows the same bounded-repair path as any
+other turn and leaves the post-review stage incomplete for operator follow-up.
+Verification is structured (result files remain the canonical contract), never
+a prose read. The verifier runs in the implementation worktree and receives its
+git branch, HEAD, porcelain status, changed-file list, and diff statistics as
+evidence.
 
 ## 5. Human Approval and Audit
 
 source: V2 section 8; Phase 6 dashboard
 
-The human end reuses Phase 6 with no new surfaces:
+The human end reuses Phase 6 with no new event kinds or decision schema:
 
-- Approval, rejection, and approval-with-deviation post through
-  `humanDecision`.
-- The dashboard drill-down chain
-  (`summary -> objection -> decision -> evidence -> transcript`) extends to
-  implementation artifacts: the implementation turn's result and worktree
-  reference are audit links resolved against the seeded DB, exactly like
-  review transcripts.
-- Notifications fire on `approval_requested` when an implementation result is
-  ready for human sign-off and on `ImplementationBlocked`.
+- Plan approval and rejection post through `humanDecision` before
+  implementation starts.
+- Blocked or deviating implementations emit `ImplementationBlocked`, notify the
+  human, and cannot authorize their own scope change.
+- Implementation and verification remain in the same durable turn, artifact,
+  and event records as review work. The verifier prompt records the worktree
+  path and git evidence used for its decision.
 
 ## 6. Configuration Surface
 
@@ -184,30 +187,27 @@ The human end reuses Phase 6 with no new surfaces:
 | `PARROT_IMPL_PROVIDER` | provider id | `claude` | §3.3 |
 | `PARROT_VERIFIER_PROVIDER` | provider id | `codex` | §4 |
 | `PARROT_WORKTREE_ROOT` | path | sibling `.parrot-worktrees/<repo>` | §3.2 |
-| `worktreeCleanupPolicy` | `"manual"` | assigned question | §3.2, §8 |
 | repair bound | fixed policy | one repair | §3.3 |
 | deviation authorization | fixed policy | human required | §3.4 |
-| `providerImplementationLimits` | not implemented | assigned question | §8 |
 
 ## 7. Test Plan
 
 - **Composition:** orchestrator drives a full loop against fixtures with no live
-  model; root and global entrypoints resolve to the package; the retained legacy
-  source remains covered by the root typecheck until retirement.
+  model; root and global entrypoints resolve to the package.
 - **Implementation:** approved plan spawns an isolated agent; completed result
   round-trips `ImplementationResultSchema`; blocked result emits
   `ImplementationBlocked` and escalates; deviation request routes to
-  `humanDecision` and does not self-authorize; deadline and reconciliation
-  fixtures exercise the Phase 2 adapter paths.
+  `ImplementationBlocked` and does not self-authorize; deadline and
+  reconciliation fixtures exercise the Phase 2 adapter paths.
 - **Verification:** completed implementation runs `resolution_verification`;
-  verification failure triggers bounded repair then escalation; CLI tests pin
-  the shared implementation/verifier worktree and its git evidence.
-- **Approval and audit:** approval posts the right events; dashboard drill-down
-  resolves implementation artifact and worktree references against the seeded
-  DB; notifications fire per kind.
-- **Cost and health:** implementation session-log fixtures per provider ingest
-  through `submitUsage`; duplicate message ID idempotent; health metrics cover
-  implementation turns.
+  validation failure gets one bounded repair, and an unresolved result leaves
+  the post-review stage incomplete. Worktree regression tests pin identity and
+  ownership; the recorded live parity run confirms that implementation and
+  verification share the worktree and that the verifier receives git evidence.
+- **Approval and audit:** approval posts the right events; blocked and deviating
+  implementations notify through the existing escalation sink.
+- **Cost and health:** the shared provider/session identity and Phase 6 ledger
+  seams accept implementation turns without a Phase 7-specific contract.
 - All LLM calls faked via fixtures; no live-model dependence.
 
 ## 8. Assigned Open Questions
@@ -240,5 +240,5 @@ The human end reuses Phase 6 with no new surfaces:
   -> verify, run from one workspace composition root.
 
 Completes the MVP. After this phase the platform runs end to end from a task to
-an approved, verified implementation. Legacy root retirement and automatic
-worktree cleanup remain operational follow-ups, not missing package behavior.
+an approved, verified implementation. Automatic worktree cleanup remains an
+operational follow-up, not missing package behavior.

@@ -16,15 +16,24 @@ An envelope contains `workflowId`, `iterationId`, `turnId`, `schemaVersion` (`v<
 
 ## 4. Platform events
 
-The approved v1 event catalog is exactly: `TurnCompleted`, `TurnFailed`, `AgentTimedOut`, `ObjectionRaised`, `ObjectionResolved`, `ConsensusReached`, `HumanApproved`, `HumanRejected`, `ImplementationBlocked`, `BudgetCapReached`, `IterationCapReached`, `OrphanResultSeen`, `UsageRecorded`, and `VerificationCompleted`. Every event has `eventId`, `occurredAt`, and `workflowId`; other correlation fields are present when applicable. The first twelve come from the Phase 1 approval, `UsageRecorded` is an approved Phase 4 additive revision, and `VerificationCompleted` is an approved Phase 7 additive revision.
+The v1 event catalog contains `TurnCompleted`, `TurnFailed`, `AgentTimedOut`,
+`ObjectionRaised`, `ObjectionResolved`, `ConsensusReached`, `HumanApproved`,
+`HumanRejected`, `ImplementationBlocked`, `BudgetCapReached`,
+`IterationCapReached`, `OrphanResultSeen`, `UsageRecorded`,
+`VerificationCompleted`, `ObjectionStalemate`, `GuardrailConflict`, and
+`PlanChurnDetected`. Every event has `eventId`, `occurredAt`, and `workflowId`;
+other correlation fields are present when applicable. The first twelve come
+from the Phase 1 approval. Later phases approved the additive revisions:
+`UsageRecorded` (Phase 4), `VerificationCompleted` (Phase 7),
+`ObjectionStalemate` (Phase 9), `GuardrailConflict` (Phase 10), and
+`PlanChurnDetected` (Phase 12).
 
 ## 5. Role result schemas
 
 Zod schemas cover planner proposals, reviewer objections, resolution verification, frontier reports, implementation results, and objection merges. The merge result schema includes cluster proposals with `representativeClaim` and optional `mergeRationale`; cluster severity is recomputed deterministically as member maximum by Phase 5 post-processing (LLM-emitted severity is ignored). Role results are encoded as TOON and validated at the LLM boundary. Natural-language fields are data, never executable orchestration instructions.
 
 The canonical TOON codec lives in `packages/contracts/src/toon/` and is
-consumed by the root orchestrator and persistence package. There is no second
-platform TOON dialect.
+consumed by the workspace packages. There is no second platform TOON dialect.
 
 ## 6. Runtime signals
 
@@ -54,4 +63,8 @@ Each role schema is validated independently. A malformed result gets one bounded
 
 ## 12. Test plan and open questions
 
-Contract tests cover TOON round trips, envelope predicates, the fourteen-event catalog, eleven-signal taxonomy, objection transitions, and additive versioning. Phase 1 records the schema-evolution question: how aggressively schemas may evolve before persistent planner continuity requires a major version.
+Contract tests cover TOON round trips, envelope predicates, the seventeen-event
+catalog, eleven-signal taxonomy, objection transitions, and additive
+versioning. Phase 1 records the schema-evolution question: how aggressively
+schemas may evolve before persistent planner continuity requires a major
+version.

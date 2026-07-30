@@ -33,7 +33,8 @@ The root [README](../README.md) is the concise operator entry point.
 - [UI implementation plan](../output/ui-imp-plan.md) is a historical proposal.
   The shipped dashboard is currently a Vite client plus a library HTTP API, not
   the complete command surface proposed there.
-- [Legacy retirement task](../task.md) is an open, gated maintenance task.
+- [Phase 7 retirement record](../task.md) records the live parity gate and
+  completed composition-root migration.
 - [To-do](../todo.md) records shipped work and the remaining deferred items.
 
 ## Source of truth

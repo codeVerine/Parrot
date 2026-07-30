@@ -63,6 +63,20 @@ class FallbackClient extends Protocol16SocketClient {
   }
 }
 
+class CliSubmitClient extends Protocol16SocketClient {
+  waitCount = 0;
+  initialStatus: HerdrAgent["agent_status"] = "idle";
+
+  override async listAgents(_timeoutMs: number): Promise<HerdrAgent[]> {
+    return [agent(this.initialStatus)];
+  }
+
+  override async waitAgent(_paneId: string, _timeoutMs: number): Promise<HerdrAgent | null> {
+    this.waitCount += 1;
+    return agent("working");
+  }
+}
+
 test("socket fallback confirms paste and retries Enter until the agent acknowledges it", async () => {
   const transport = new MockTransport();
   const client = new FallbackClient(transport);
@@ -81,23 +95,30 @@ test("socket fallback confirms paste and retries Enter until the agent acknowled
   );
 });
 
-test("CLI pane.run bypasses socket paste and Enter fallback", async () => {
-  const transport = new MockTransport();
-  const client = new Protocol16SocketClient(transport);
-  const calls: Array<{ paneId: string; command: string; timeoutMs: number }> = [];
-  const cli: HerdrCli = {
-    schema: async () => ({}),
-    integrationStatus: async () => ({}),
-    paneRun: async (paneId, command, timeoutMs) => {
-      calls.push({ paneId, command, timeoutMs });
-    },
-  };
+test("CLI pane.run presses Enter when the provider has not started", async () => {
+  for (const status of ["idle", "done"] as const) {
+    const transport = new MockTransport();
+    const client = new CliSubmitClient(transport);
+    client.initialStatus = status;
+    const calls: Array<{ paneId: string; command: string; timeoutMs: number }> = [];
+    const cli: HerdrCli = {
+      schema: async () => ({}),
+      integrationStatus: async () => ({}),
+      paneRun: async (paneId, command, timeoutMs) => {
+        calls.push({ paneId, command, timeoutMs });
+      },
+    };
 
-  await client.sendAgent("pane-1", "prompt", "PARROT-MARKER", 1_000, cli);
+    await client.sendAgent("pane-1", "prompt", "PARROT-MARKER", 1_000, cli);
 
-  assert.equal(transport.requests.length, 0);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0]?.paneId, "pane-1");
-  assert.equal(calls[0]?.command, "prompt");
-  assert.ok((calls[0]?.timeoutMs ?? 0) > 0 && (calls[0]?.timeoutMs ?? Infinity) <= 1_000);
+    assert.deepEqual(
+      transport.requests.map(({ method, params }) => ({ method, params })),
+      [{ method: "pane.send_keys", params: { pane_id: "pane-1", keys: ["Enter"] } }],
+    );
+    assert.equal(client.waitCount, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.paneId, "pane-1");
+    assert.equal(calls[0]?.command, "prompt");
+    assert.ok((calls[0]?.timeoutMs ?? 0) > 0 && (calls[0]?.timeoutMs ?? Infinity) <= 1_000);
+  }
 });

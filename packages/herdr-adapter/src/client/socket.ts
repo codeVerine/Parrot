@@ -113,27 +113,34 @@ export class Protocol16SocketClient implements HerdrClient {
     const deadline = Date.now() + timeoutMs;
     const remaining = (): number => Math.max(0, deadline - Date.now());
 
-    // Atomic pane run via CLI. Exit code 0 means command was dispatched.
+    // `pane run` can return successfully while the command is still sitting at
+    // an idle provider prompt. Check the live state and fall through to the
+    // bounded Enter confirmation when Herdr has not observed execution.
     if (cli) {
       await cli.paneRun(target, text, remaining());
-      return;
-    }
+      const current = (await this.listAgents(remaining()))
+        .find((candidate) => candidate.pane_id === target);
+      if (current && ["working", "blocked"].includes(current.agent_status as string)) {
+        return;
+      }
+    } else {
+      // Socket fallback: paste text and confirm it before pressing Enter.
+      await this.transport.request("pane.send_text", { pane_id: target, text }, remaining());
 
-    // Fallback: paste text, confirm via pane.read, then Enter.
-    await this.transport.request("pane.send_text", { pane_id: target, text }, remaining());
+      const PANE_READ_POLL_MS = 25;
+      for (;;) {
+        const read = await this.readPane(target, remaining());
+        if (read.text.includes(verificationMarker) && !read.truncated) break;
+        if (remaining() <= 0) {
+          throw new Error(
+            `Paste not confirmed: verification marker "${verificationMarker}" not observed in pane ${target} within ${timeoutMs}ms.`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, PANE_READ_POLL_MS));
+      }
+    }
 
     const PANE_READ_POLL_MS = 25;
-    for (;;) {
-      const read = await this.readPane(target, remaining());
-      if (read.text.includes(verificationMarker) && !read.truncated) break;
-      if (remaining() <= 0) {
-        throw new Error(
-          `Paste not confirmed: verification marker "${verificationMarker}" not observed in pane ${target} within ${timeoutMs}ms.`,
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, PANE_READ_POLL_MS));
-    }
-
     const ENTER_CONFIRMATION_MS = 750;
     const MAX_ENTER_ATTEMPTS = 3;
 
