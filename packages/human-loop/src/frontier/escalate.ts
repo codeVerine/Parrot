@@ -16,6 +16,28 @@ export function frontierFailedAttention(
   };
 }
 
+/**
+ * Build an `escalation` attention request from a reason and objection ids.
+ * Mirrors what the engine's `adaptEscalationSink` produces for non-budget
+ * escalations so a loop that suppresses the engine's notification
+ * (`reportGuardrailConflict({ notify: false })`) can re-emit the request
+ * with the configured dashboard base and consistent kind / summary.
+ */
+export function escalationAttention(
+  workflowId: string,
+  config: HumanLoopConfig,
+  reason: string,
+  openObjectionIds: string[] = [],
+): HumanAttentionRequest {
+  return {
+    workflowId,
+    kind: "escalation",
+    summary: reason,
+    dashboardDeepLink: `${config.dashboardDeepLinkBase}/${workflowId}`,
+    openObjectionIds,
+  };
+}
+
 /** Adapt Phase 4 NotificationSink to the Phase 6 HumanNotificationSink. */
 export function adaptEscalationSink(
   human: HumanNotificationSink,

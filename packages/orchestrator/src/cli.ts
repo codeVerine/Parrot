@@ -16,7 +16,7 @@ import { PersistenceStore } from "@platform/persistence";
 import { resolveCodebaseContext } from "./codebase-context.js";
 import { createComposition } from "./composition.js";
 import { createHerdrRunner } from "./herdr-runner.js";
-import { runReviewLoop, type HumanDecision } from "./loop.js";
+import { runReviewLoop, type HumanDecision, type StalemateChoice } from "./loop.js";
 import {
   reuseImplementation,
   selectResumeWorkflowId,
@@ -137,6 +137,21 @@ async function main(): Promise<void> {
     return { decision: approved ? "approved" : "rejected", waiveOpenObjections: ctx.openObjectionIds.length > 0 };
   };
 
+  const onStalemate = async (ctx: { objectionIds: string[]; report: string; reason: string }): Promise<StalemateChoice> => {
+    console.log("\n" + ctx.report + "\n");
+    const label = ctx.reason === "plan_churn" ? "Plan churn" : ctx.reason === "guardrail_conflict" ? "Guardrail conflict" : "Objection stalemate";
+    const answer = (
+      await rl.question(
+        `${label} on ${ctx.objectionIds.join(", ")}. accept_mitigation/accept_objection/abort? `,
+      )
+    )
+      .trim()
+      .toLowerCase();
+    if (answer.startsWith("accept_m") || answer === "m") return "accept_mitigation";
+    if (answer.startsWith("accept_o") || answer === "o") return "accept_objection";
+    return "abort";
+  };
+
   try {
     const review = await runReviewLoop(comp, {
       workflowId,
@@ -146,10 +161,14 @@ async function main(): Promise<void> {
       reviewerAgentIds: ["reviewer"],
       frontierAgentId: "frontier",
       decide,
+      onStalemate,
       codebaseContext,
       ...(resumeSeed ? { resume: resumeSeed } : {}),
     });
     console.log(`Review loop finished: phase=${review.phase}, iterations=${review.iterations}`);
+    if (review.escalation) {
+      console.log(`Escalation: ${review.escalation.reason} (${review.escalation.objectionIds.join(", ")})`);
+    }
 
     if (review.phase === "approved") {
       const iterationId = `${workflowId}-impl`;

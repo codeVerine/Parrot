@@ -32,7 +32,10 @@ export {
   type HumanDecisionResolver,
   type ReviewLoopInput,
   type ReviewLoopResult,
+  type StalemateChoice,
+  type StalemateResolver,
 } from "./loop.js";
+export { buildStalemateReport, buildChurnReport } from "./escalation-report.js";
 export {
   runTurn,
   adoptResumeCandidate,
@@ -51,3 +54,13 @@ export {
   type ResumableTurn,
   type ResumeSeed,
 } from "./resume.js";
+export {
+  addedRemovedHeadings,
+  headingChangeRatio,
+  isMajorRestructuring,
+  loadProposalAtIteration,
+  proposalSimilarity,
+  sectionHeadings,
+  type ProposalSnapshot,
+  type RestructuringOptions,
+} from "./proposal-diff.js";

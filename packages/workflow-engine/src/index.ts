@@ -19,6 +19,7 @@ export {
   hasOpenObjections,
   humanRuleAllows,
   openObjectionIds,
+  stalemateObjectionIds,
   underBudgetCap,
   underIterationCap,
 } from "./guards.js";

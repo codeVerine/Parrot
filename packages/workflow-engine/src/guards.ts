@@ -11,6 +11,14 @@ export function hasOpenObjections(state: FoldedState): boolean {
   return openObjectionIds(state).length > 0;
 }
 
+/** Open objections that were resolved once and re-raised: the stalemate signal. */
+export function stalemateObjectionIds(state: FoldedState): string[] {
+  return Object.values(state.objections)
+    .filter((objection) => objection.status === "open" && objection.reraiseCount >= 1)
+    .map((objection) => objection.objectionId)
+    .sort();
+}
+
 export function underIterationCap(state: FoldedState, config: WorkflowEngineConfig): boolean {
   return state.iterationCount < config.maxIterations;
 }

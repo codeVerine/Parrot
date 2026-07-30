@@ -15,8 +15,8 @@ const BaseEventSchema = CorrelationSchema.extend({
 const event = <K extends string>(kind: K, payload: z.ZodRawShape = {}) =>
   BaseEventSchema.extend({ kind: z.literal(kind), payload: z.object(payload) });
 
-// The first twelve entries are the approved Phase 1 catalog. The last two are
-// additive revisions approved by the Phase 4 and Phase 7 plans respectively.
+// The first twelve entries are the approved Phase 1 catalog. The rest are
+// additive revisions approved by the Phase 4, Phase 7, Phase 9, and Phase 10 plans respectively.
 export const EVENT_KINDS = [
   "TurnCompleted",
   "TurnFailed",
@@ -32,6 +32,9 @@ export const EVENT_KINDS = [
   "OrphanResultSeen",
   "UsageRecorded",
   "VerificationCompleted",
+  "ObjectionStalemate",
+  "GuardrailConflict",
+  "PlanChurnDetected",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
@@ -64,6 +67,9 @@ export const EventSchemas = {
     commands: z.array(z.object({ command: z.string().min(1), contentHash: z.string().min(1), exitCode: z.number().int() })),
     logArtifacts: z.array(z.object({ path: z.string().min(1), contentHash: z.string().min(1) })),
   }),
+  ObjectionStalemate: event("ObjectionStalemate", { objectionIds: z.array(z.string().min(1)).min(1) }),
+  GuardrailConflict: event("GuardrailConflict", { objectionIds: z.array(z.string().min(1)).min(1), detail: z.string().min(1) }),
+  PlanChurnDetected: event("PlanChurnDetected", { fromIterationId: z.string().min(1), toIterationId: z.string().min(1), similarity: z.number().min(0).max(1), detail: z.string().min(1) }),
 } satisfies Record<EventKind, z.ZodTypeAny>;
 
 export const EventSchema = z.discriminatedUnion(

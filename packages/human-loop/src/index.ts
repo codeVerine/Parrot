@@ -12,6 +12,7 @@ export {
 export {
   adaptEscalationSink,
   approvalRequestedAttention,
+  escalationAttention,
   frontierFailedAttention,
 } from "./frontier/escalate.js";
 export {
