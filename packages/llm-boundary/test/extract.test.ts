@@ -133,6 +133,102 @@ test("unsupported schemaVersion is rejected", () => {
   }
 });
 
+test("planner revised_plan addressal with whitespace-only evidence needs repair, then fails on repair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath: "plan.md",
+      summary: "x",
+      objectionsAddressed: [
+        // A true "" fails ObjectionAddressalSchema's min(1) as schema_invalid before this
+        // rule ever runs; whitespace-only satisfies min(1) but is still not real evidence.
+        { objectionId: "OBJ-1", resolutionStrategy: "revised_plan", evidence: "   ", requiresGuardrailException: false },
+      ],
+    },
+  });
+
+  const primary = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "primary" },
+    inputObjectionIds: ["OBJ-1"],
+  });
+  assert.equal(primary.outcome, "needsRepair");
+  if (primary.outcome === "needsRepair") assert.equal(primary.reason, "evidence_rules");
+
+  const repair = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "repair" },
+    inputObjectionIds: ["OBJ-1"],
+  });
+  assert.equal(repair.outcome, "failed");
+});
+
+test("planner addressal referencing an objection ID outside inputObjectionIds fails", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath: "plan.md",
+      summary: "x",
+      objectionsAddressed: [
+        { objectionId: "OBJ-9", resolutionStrategy: "revised_plan", evidence: "plan.md:3 fixed", requiresGuardrailException: false },
+      ],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "primary" },
+    inputObjectionIds: ["OBJ-1"],
+  });
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") assert.equal(verdict.reason, "evidence_rules");
+});
+
+test("planner legacy bare-ID addressal validates without evidence or inputObjectionIds", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath: "plan.md",
+      summary: "x",
+      objectionsAddressed: ["OBJ-1"],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "primary" },
+  });
+  assert.equal(verdict.outcome, "valid");
+});
+
+test("planner structured addressal with quoted evidence and a covered ID validates", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath: "plan.md",
+      summary: "x",
+      objectionsAddressed: [
+        { objectionId: "OBJ-1", resolutionStrategy: "retracted", evidence: "proposal.md:20 disproves the premise", requiresGuardrailException: false },
+      ],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "primary" },
+    inputObjectionIds: ["OBJ-1"],
+  });
+  assert.equal(verdict.outcome, "valid");
+});
+
 test("reviewer empty evidence without evidence_missing fails", () => {
   const { extractor } = createBoundary();
   const bytes = envelopeBytes({
@@ -155,6 +251,109 @@ test("reviewer empty evidence without evidence_missing fails", () => {
       turnType: "reviewer_review",
       attempt: "primary",
     },
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.equal(verdict.reason, "evidence_rules");
+  }
+});
+
+test("reviewer zero objections without cleanRationale → needsRepair on primary", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [] },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.equal(verdict.reason, "evidence_rules");
+    assert.match(verdict.diagnostics, /cleanRationale/);
+  }
+});
+
+test("reviewer zero objections without cleanRationale → failed on repair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [] },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "repair" },
+  });
+
+  assert.equal(verdict.outcome, "failed");
+});
+
+test("reviewer zero objections with whitespace-only cleanRationale → needsRepair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [], cleanRationale: "   " },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.equal(verdict.reason, "evidence_rules");
+  }
+});
+
+test("reviewer zero objections with cleanRationale → valid", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [], cleanRationale: "All acceptance criteria and guardrails are satisfied." },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+  });
+
+  assert.equal(verdict.outcome, "valid");
+});
+
+test("reviewer non-empty objections without cleanRationale → valid", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      objections: [{ id: "OBJ-1", severity: "major", claim: "bad", evidence: ["src/a.ts:1"] }],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+  });
+
+  assert.equal(verdict.outcome, "valid");
+});
+
+test("adversarial_review zero objections without cleanRationale → needsRepair on primary", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [] },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "adversarial_review", attempt: "primary" },
   });
 
   assert.equal(verdict.outcome, "needsRepair");

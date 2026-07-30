@@ -388,7 +388,14 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
           role: "planner",
           proposalPath: "path/to/proposal.md",
           summary: "Short summary.",
-          objectionsAddressed: [],
+          objectionsAddressed: [
+            {
+              objectionId: "OBJ-1",
+              resolutionStrategy: "revised_plan",
+              evidence: "Exact quote from proposal.md or pasted code.",
+              requiresGuardrailException: false,
+            },
+          ],
         },
       };
     case "reviewer_review":
@@ -396,7 +403,7 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
       return {
         ...base,
         role: "reviewer",
-        payload: { role: "reviewer", objections: [] },
+        payload: { role: "reviewer", objections: [], cleanRationale: "The plan satisfies criterion X because ... and guardrail Y because ..." },
       };
     case "resolution_verification":
       return {
