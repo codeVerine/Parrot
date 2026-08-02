@@ -97,3 +97,49 @@ test("PlannerResultSchema rejects structured addressals with missing required fi
     { objectionId: "OBJ-1", resolutionStrategy: "revised_plan", evidence: "quote", requiresGuardrailException: false, extra: true },
   ])));
 });
+
+test("PlannerResultSchema accepts citations and keeps legacy results without them valid", () => {
+  const withCitations = PlannerResultSchema.parse({
+    ...base([]),
+    citations: [
+      {
+        path: "packages/orchestrator/src/loop.ts",
+        startLine: 10,
+        endLine: 12,
+        quote: "export function runReviewLoop() {}",
+      },
+    ],
+  });
+  assert.equal(withCitations.citations?.length, 1);
+  assert.equal(withCitations.citations?.[0]?.path, "packages/orchestrator/src/loop.ts");
+
+  const legacy = PlannerResultSchema.parse(base([]));
+  assert.equal(legacy.citations, undefined);
+});
+
+test("PlannerResultSchema rejects malformed citations", () => {
+  assert.throws(() =>
+    PlannerResultSchema.parse({
+      ...base([]),
+      citations: [{ path: "a.ts", startLine: 5, endLine: 2, quote: "long enough quote" }],
+    }),
+  );
+  assert.throws(() =>
+    PlannerResultSchema.parse({
+      ...base([]),
+      citations: [{ path: "a.ts", startLine: 1, endLine: 1, quote: "short", extra: true }],
+    }),
+  );
+  assert.throws(() =>
+    PlannerResultSchema.parse({
+      ...base([]),
+      citations: [{ path: "", startLine: 1, endLine: 1, quote: "long enough quote" }],
+    }),
+  );
+  assert.throws(() =>
+    PlannerResultSchema.parse({
+      ...base([]),
+      citations: [{ path: "a.ts", startLine: 1, endLine: 1, quote: "too-short" }],
+    }),
+  );
+});

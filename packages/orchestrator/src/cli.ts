@@ -13,19 +13,32 @@ import {
   HerdrAgentRuntime,
   HerdrCommandLine,
   LineSocketTransport,
+  parsePermissionMode,
+  providerArgvForPermissionMode,
   Protocol16SocketClient,
+  reclaimEmptyRootPane,
   type AgentHandle,
 } from "@platform/herdr-adapter";
 import { PersistenceStore } from "@platform/persistence";
+import type { ObjectionView } from "@platform/llm-boundary";
 import {
   findStoredAgent,
   workflowRoleAgentKey,
   workflowRoleAgentName,
 } from "./agent-session.js";
 import { resolveCodebaseContext } from "./codebase-context.js";
+import {
+  askOptionalGuidance,
+  askUntilValid,
+  formatDecisionPrompt,
+  formatStalematePrompt,
+  parseDecisionInput,
+  parseStalemateInput,
+} from "./cli-format.js";
 import { createComposition } from "./composition.js";
 import { createHerdrRunner } from "./herdr-runner.js";
-import { runReviewLoop, type HumanDecision, type StalemateChoice } from "./loop.js";
+import { runReviewLoop, type HumanDecision, type StalemateChoice, type StalemateResolution } from "./loop.js";
+import { assertProposalFresh } from "./proposal-integrity.js";
 import { ensureWorktree } from "./worktree.js";
 import {
   reuseImplementation,
@@ -115,7 +128,15 @@ async function main(): Promise<void> {
   const socketPath = await resolveSocketPath(herdrBin);
   const client = new Protocol16SocketClient(new LineSocketTransport(socketPath));
   const cli = new HerdrCommandLine(herdrBin);
-  const runtime = await HerdrAgentRuntime.create({ client, cli });
+  // Default: auto-approve edits/FS inside each agent's cwd (project or worktree);
+  // outside that tree providers still prompt (Claude/Gemini) or sandbox-deny (Codex).
+  // Override with PARROT_PERMISSION_MODE=ask|bypass.
+  const permissionMode = parsePermissionMode(env.PARROT_PERMISSION_MODE);
+  const runtime = await HerdrAgentRuntime.create({
+    client,
+    cli,
+    config: { providerArgv: providerArgvForPermissionMode(permissionMode) },
+  });
 
   const storedWorkspaceId = resumeRequest.requested
     ? String(store.readRows("workflows").find((row) => String(row.workflow_id) === workflowId)?.workspace_id ?? "")
@@ -127,7 +148,16 @@ async function main(): Promise<void> {
   // Spawn agents into one dedicated tab so they do not split the caller's terminal
   // pane down to an unreadable size. Individual role panes are started lazily;
   // PARROT_TAB reuses an existing tab if provided.
-  const tabId = env.PARROT_TAB ?? (await client.createTab(workspaceId, "parrot agents", 10_000));
+  //
+  // Herdr 0.7.3 `agent.start` always splits (defaults to right), so a fresh tab's
+  // root shell would otherwise stay empty beside the first agent. We reclaim that
+  // empty root after the first fresh start; later roles then split as intended.
+  const createdTab = env.PARROT_TAB
+    ? null
+    : await client.createTab(workspaceId, "parrot agents", 10_000);
+  const tabId = createdTab?.tabId ?? env.PARROT_TAB;
+  if (!tabId) throw new Error("missing parrot tab id");
+  let reclaimedRootPane = false;
 
   const worktreeRoot = env.PARROT_WORKTREE_ROOT ? resolve(projectDir, env.PARROT_WORKTREE_ROOT) : undefined;
 
@@ -158,10 +188,23 @@ async function main(): Promise<void> {
       ...(storedAgent ? { resume: storedAgent.resume } : {}),
     };
     const starting = storedAgent
-      ? runtime.attach({ ...agentSpec, paneId: storedAgent.paneId })
-          .then((attached) => attached ?? runtime.start(agentSpec))
-      : runtime.start(agentSpec);
-    const cachedStart = starting.then((handle) => {
+      ? runtime.attach({ ...agentSpec, paneId: storedAgent.paneId }).then(async (attached) => {
+          if (attached) return { handle: attached, freshStart: false as const };
+          return { handle: await runtime.start(agentSpec), freshStart: true as const };
+        })
+      : runtime.start(agentSpec).then((handle) => ({ handle, freshStart: true as const }));
+    const cachedStart = starting.then(async ({ handle, freshStart }) => {
+      if (
+        createdTab &&
+        !reclaimedRootPane &&
+        freshStart &&
+        handle.paneId !== createdTab.rootPaneId
+      ) {
+        reclaimedRootPane = true;
+        await reclaimEmptyRootPane(client, createdTab.rootPaneId, handle.paneId, 10_000).catch(() => {
+          // Best-effort: an already-closed root must not fail agent startup.
+        });
+      }
       store.saveAgent({
         agentId: agentKey,
         paneId: handle.paneId,
@@ -192,6 +235,7 @@ async function main(): Promise<void> {
   const runner = createHerdrRunner({
     runtime,
     getHandle,
+    onNotice: (message) => console.log(message),
     ...(turnMaxMs ? { maxMs: turnMaxMs } : {}),
     ...(turnIdleMs ? { idleTimeoutMs: turnIdleMs } : {}),
   });
@@ -200,6 +244,7 @@ async function main(): Promise<void> {
     runner,
     humanLoopConfig: { notificationSink: "herdr" },
     runsRoot,
+    projectDir,
   });
 
   // Resume an interrupted workflow from its persisted state, or start a fresh run. On
@@ -232,32 +277,70 @@ async function main(): Promise<void> {
   const rl = createInterface({ input: stdin, output: stdout });
   const decide = async (ctx: {
     openObjectionIds: string[];
+    openObjections: ObjectionView[];
     frontierReadiness: "ready" | "not_ready" | null;
+    proposalPath?: string;
+    proposalHash?: string;
+    proposalSummary?: string;
+    pairReviewSummaries?: Array<{ agentId: string; summary: string }>;
   }): Promise<HumanDecision> => {
-    const answer = (
-      await rl.question(
-        `Frontier readiness=${ctx.frontierReadiness ?? "-"}, open objections=${ctx.openObjectionIds.length}. approve/reject? `,
-      )
-    )
-      .trim()
-      .toLowerCase();
-    const approved = answer.startsWith("a");
-    return { decision: approved ? "approved" : "rejected", waiveOpenObjections: ctx.openObjectionIds.length > 0 };
+    const decision = await askUntilValid({
+      prompt: formatDecisionPrompt({
+        openObjections: ctx.openObjections,
+        frontierReadiness: ctx.frontierReadiness,
+        ...(ctx.proposalPath ? { proposalPath: ctx.proposalPath } : {}),
+        ...(ctx.proposalHash ? { proposalHash: ctx.proposalHash } : {}),
+        ...(ctx.proposalSummary ? { proposalSummary: ctx.proposalSummary } : {}),
+        ...(ctx.pairReviewSummaries ? { pairReviewSummaries: ctx.pairReviewSummaries } : {}),
+      }),
+      question: (message) => rl.question(message),
+      parse: parseDecisionInput,
+      invalidHint: "Unrecognized input. Valid options: 1 (approve), 2 (reject).",
+      writeLine: (message) => stdout.write(`${message}\n`),
+    });
+    const guidance = await askOptionalGuidance({
+      question: (message) => rl.question(message),
+      writeLine: (message) => stdout.write(`${message}\n`),
+    });
+    return {
+      decision,
+      waiveOpenObjections: ctx.openObjectionIds.length > 0,
+      ...(guidance ? { comment: guidance } : {}),
+    };
   };
 
-  const onStalemate = async (ctx: { objectionIds: string[]; report: string; reason: string }): Promise<StalemateChoice> => {
-    console.log("\n" + ctx.report + "\n");
-    const label = ctx.reason === "plan_churn" ? "Plan churn" : ctx.reason === "guardrail_conflict" ? "Guardrail conflict" : "Objection stalemate";
-    const answer = (
-      await rl.question(
-        `${label} on ${ctx.objectionIds.join(", ")}. accept_mitigation/accept_objection/abort? `,
-      )
-    )
-      .trim()
-      .toLowerCase();
-    if (answer.startsWith("accept_m") || answer === "m") return "accept_mitigation";
-    if (answer.startsWith("accept_o") || answer === "o") return "accept_objection";
-    return "abort";
+  const onStalemate = async (ctx: {
+    objectionIds: string[];
+    report: string;
+    reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn";
+    proposalPath?: string;
+    proposalHash?: string;
+    proposalSummary?: string;
+    openObjections?: ObjectionView[];
+  }): Promise<StalemateResolution> => {
+    const choice: StalemateChoice = await askUntilValid({
+      prompt: formatStalematePrompt({
+        objectionIds: ctx.objectionIds,
+        report: ctx.report,
+        reason: ctx.reason,
+        ...(ctx.openObjections ? { openObjections: ctx.openObjections } : {}),
+        ...(ctx.proposalPath ? { proposalPath: ctx.proposalPath } : {}),
+        ...(ctx.proposalHash ? { proposalHash: ctx.proposalHash } : {}),
+        ...(ctx.proposalSummary ? { proposalSummary: ctx.proposalSummary } : {}),
+      }),
+      question: (message) => rl.question(message),
+      parse: parseStalemateInput,
+      invalidHint: "Unrecognized input. Valid options: 1 (accept mitigation), 2 (continue planning), 3 (abort).",
+      writeLine: (message) => stdout.write(`${message}\n`),
+    });
+    const guidance = await askOptionalGuidance({
+      question: (message) => rl.question(message),
+      writeLine: (message) => stdout.write(`${message}\n`),
+    });
+    return {
+      choice,
+      ...(guidance ? { guidance } : {}),
+    };
   };
 
   try {
@@ -280,10 +363,25 @@ async function main(): Promise<void> {
     }
 
     if (review.phase === "approved") {
+      if (!review.finalProposalPath || !review.finalProposalHash) {
+        console.error("Refusing implementation: approved review is missing Author proposal path/hash");
+        exit(1);
+      }
+      const fresh = assertProposalFresh({
+        proposalPath: review.finalProposalPath,
+        expectedHash: review.finalProposalHash,
+      });
+      if (!fresh.ok) {
+        console.error(`Refusing implementation: ${fresh.reason}`);
+        exit(1);
+      }
       const iterationId = `${workflowId}-impl`;
 
       // On resume, reuse a completed implementation turn instead of re-running it.
-      const reused = reuseImplementation(store, workflowId, iterationId);
+      const reused = reuseImplementation(store, workflowId, iterationId, {
+        proposalPath: review.finalProposalPath,
+        proposalHash: review.finalProposalHash,
+      });
       let implTurnId: string | undefined;
       let implSummary: string | undefined;
       if (reused) {
@@ -296,7 +394,9 @@ async function main(): Promise<void> {
           iterationId,
           agentId: "implementation",
           task,
-          ...(review.finalProposalPath ? { proposalPath: review.finalProposalPath } : {}),
+          proposalPath: review.finalProposalPath,
+          proposalHash: review.finalProposalHash,
+          ...(review.humanMessages.length > 0 ? { humanMessages: review.humanMessages } : {}),
         });
         console.log(`[implementation post-review] status=${impl.status}`);
         if (impl.status === "completed") {

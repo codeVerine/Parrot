@@ -31,7 +31,7 @@ test("hasOpenObjections is true for any severity including minor", () => {
   })), false);
 });
 
-test("stalemateObjectionIds: only open objections with reraiseCount >= 1, sorted", () => {
+test("stalemateObjectionIds: only open objections with reraiseCount >= threshold, sorted", () => {
   assert.deepEqual(stalemateObjectionIds(state({
     objections: {
       "OBJ-2": { objectionId: "OBJ-2", severity: "minor", status: "open", reraiseCount: 1 },
@@ -40,6 +40,13 @@ test("stalemateObjectionIds: only open objections with reraiseCount >= 1, sorted
       "OBJ-4": { objectionId: "OBJ-4", severity: "blocking", status: "resolved", reraiseCount: 1 },
     },
   })), ["OBJ-1", "OBJ-2"]);
+  assert.deepEqual(stalemateObjectionIds(state({
+    stalemateReraiseThreshold: 2,
+    objections: {
+      "OBJ-2": { objectionId: "OBJ-2", severity: "minor", status: "open", reraiseCount: 1 },
+      "OBJ-1": { objectionId: "OBJ-1", severity: "major", status: "open", reraiseCount: 2 },
+    },
+  })), ["OBJ-1"]);
   assert.deepEqual(stalemateObjectionIds(state()), []);
 });
 

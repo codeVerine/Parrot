@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { agentId } from "@platform/contracts";
-import type { AgentHandle, HerdrAgentRuntime } from "@platform/herdr-adapter";
+import { ArtifactRejectedError, type AgentHandle, type HerdrAgentRuntime } from "@platform/herdr-adapter";
 import { createHerdrRunner } from "../src/herdr-runner.js";
 import type { AgentTurnRequest } from "../src/runner.js";
 
@@ -32,19 +32,24 @@ const handle: AgentHandle = {
   sessionPath: null,
 };
 
-test("createHerdrRunner resolves a handle only when a turn is delivered", async () => {
-  const getHandleCalls: string[] = [];
-  const runtime = {
-    send: async () => undefined,
+function fakeRuntime(startConfirmed: boolean): HerdrAgentRuntime {
+  return {
+    send: async () => ({ turnId: "turn-1", promptHash: "hash", deliveredAt: new Date().toISOString(), startConfirmed }),
     wait: async () => undefined,
     result: async () => ({ bytes: Buffer.from("result"), turnId: "turn-1" }),
   } as unknown as HerdrAgentRuntime;
+}
+
+test("createHerdrRunner resolves a handle only when a turn is delivered", async () => {
+  const getHandleCalls: string[] = [];
+  const notices: string[] = [];
   const runner = createHerdrRunner({
-    runtime,
+    runtime: fakeRuntime(true),
     getHandle: async (agent) => {
       getHandleCalls.push(agent);
       return handle;
     },
+    onNotice: (message) => notices.push(message),
     maxMs: 1_000,
     idleTimeoutMs: 100,
   });
@@ -54,4 +59,43 @@ test("createHerdrRunner resolves a handle only when a turn is delivered", async 
 
   assert.deepEqual(getHandleCalls, ["planner"]);
   assert.equal(result.resultText, "result");
+  assert.deepEqual(notices, [], "a confirmed start should not produce a notice");
+});
+
+test("createHerdrRunner notifies the operator when the agent never confirmed it started", async () => {
+  const notices: string[] = [];
+  const runner = createHerdrRunner({
+    runtime: fakeRuntime(false),
+    getHandle: async () => handle,
+    onNotice: (message) => notices.push(message),
+    maxMs: 1_000,
+    idleTimeoutMs: 100,
+  });
+
+  const result = await runner.deliver(request());
+
+  assert.equal(result.resultText, "result", "the turn still completes from the result file");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /\[planner\] claude \(pane pane-1\) has not confirmed it started working/);
+  assert.match(notices[0]!, /Ctrl\+C/);
+});
+
+test("createHerdrRunner rewrites ArtifactRejected into an operator-facing error", async () => {
+  const runner = createHerdrRunner({
+    runtime: {
+      send: async () => ({ turnId: "turn-1", promptHash: "hash", deliveredAt: new Date().toISOString(), startConfirmed: true }),
+      wait: async () => undefined,
+      result: async () => {
+        throw new ArtifactRejectedError("stale_mtime", "/tmp/result.toon", "1", "2");
+      },
+    } as unknown as HerdrAgentRuntime,
+    getHandle: async () => handle,
+    maxMs: 1_000,
+    idleTimeoutMs: 100,
+  });
+
+  await assert.rejects(
+    () => runner.deliver(request()),
+    /Agent planner wrote a result Parrot cannot accept \(stale_mtime\)/,
+  );
 });

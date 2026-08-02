@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parseToon } from "@platform/contracts";
 import { createEngine, eventKinds, seedWorkflow } from "./helpers.js";
 
 test("happy path: planning workflow reaches human approval", () => {
@@ -130,6 +131,60 @@ test("objection stalemate escalates ahead of the iteration cap, even with iterat
   assert.equal(state.iterationCapReached, false);
   assert.ok(eventKinds(store).includes("ObjectionStalemate"));
   assert.ok(!eventKinds(store).includes("IterationCapReached"));
+});
+
+test("continueAfterStalemate bumps threshold and maxIterations, returns to planner_turn", () => {
+  const { store, engine } = createEngine({ maxIterations: 5 });
+  seedWorkflow(engine, { config: { maxIterations: 5 } });
+  engine.advancePlanning("workflow-1", "plannerCompleted");
+  engine.advancePlanning("workflow-1", "reviewersSpawned");
+  engine.advancePlanning("workflow-1", "objectionsCollected");
+  engine.raiseObjection({ workflowId: "workflow-1", objectionId: "OBJ-1", severity: "major", iterationId: "iteration-1" });
+  engine.advancePlanning("workflow-1", "mergeCompleted");
+  engine.advancePlanning("workflow-1", "evaluateObjectionGate", { nextIterationId: "iteration-2" });
+  engine.resolveObjection({ workflowId: "workflow-1", objectionId: "OBJ-1", resolution: "addressed" });
+  engine.advancePlanning("workflow-1", "plannerCompleted");
+  engine.advancePlanning("workflow-1", "reviewersSpawned");
+  engine.advancePlanning("workflow-1", "objectionsCollected");
+  engine.raiseObjection({ workflowId: "workflow-1", objectionId: "OBJ-1", severity: "major", iterationId: "iteration-2" });
+  engine.advancePlanning("workflow-1", "mergeCompleted");
+  engine.advancePlanning("workflow-1", "evaluateObjectionGate", { nextIterationId: "iteration-3" });
+  assert.equal(engine.getState("workflow-1").phase, "escalated");
+  const before = engine.getState("workflow-1");
+  const iterationBefore = before.iterationCount;
+
+  const continued = engine.continueAfterStalemate({
+    workflowId: "workflow-1",
+    objectionIds: ["OBJ-1"],
+  });
+  assert.equal(continued.phase, "planner_turn");
+  assert.equal(continued.stalemateReraiseThreshold, 2);
+  assert.equal(continued.iterationCount, iterationBefore);
+  assert.equal(continued.objections["OBJ-1"]?.reraiseCount, 1);
+  assert.equal(continued.objections["OBJ-1"]?.status, "open");
+  assert.ok(eventKinds(store).includes("StalemateContinued"));
+  const row = store.getWorkflow("workflow-1");
+  assert.ok(row);
+  const savedConfig = parseToon(String(row.config_toon ?? "")) as { maxIterations?: number };
+  assert.equal(savedConfig.maxIterations, 6);
+  // Threshold 2 means reraiseCount 1 no longer counts as stalemate.
+  assert.deepEqual(
+    [...Object.values(continued.objections)]
+      .filter((o) => o.status === "open" && o.reraiseCount >= continued.stalemateReraiseThreshold)
+      .map((o) => o.objectionId),
+    [],
+  );
+
+  // Another resolve→raise reaches the new threshold and stalemates again.
+  engine.resolveObjection({ workflowId: "workflow-1", objectionId: "OBJ-1", resolution: "addressed again" });
+  engine.advancePlanning("workflow-1", "plannerCompleted");
+  engine.advancePlanning("workflow-1", "reviewersSpawned");
+  engine.advancePlanning("workflow-1", "objectionsCollected");
+  engine.raiseObjection({ workflowId: "workflow-1", objectionId: "OBJ-1", severity: "major", iterationId: "iteration-3" });
+  assert.equal(engine.getState("workflow-1").objections["OBJ-1"]?.reraiseCount, 2);
+  engine.advancePlanning("workflow-1", "mergeCompleted");
+  engine.advancePlanning("workflow-1", "evaluateObjectionGate", { nextIterationId: "iteration-4" });
+  assert.equal(engine.getState("workflow-1").phase, "escalated");
 });
 
 test("budget pause during planning escalates via usage seam", () => {

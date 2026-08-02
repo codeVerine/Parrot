@@ -25,6 +25,8 @@ export const ObjectionSchema = z.object({
   claim: z.string().min(1),
   evidence: z.array(z.string()),
   evidence_missing: z.boolean().optional(),
+  /** Pair-authored fix guideline; null/absent on legacy and frontier objections. */
+  suggestedResolution: z.string().optional(),
   status: ObjectionStatusSchema,
   raisedBy: z.string().min(1),
   turnId: z.string().min(1),

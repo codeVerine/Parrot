@@ -1,11 +1,18 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { RuntimeSignal } from "@platform/contracts";
-import { ResolutionResultSchema } from "@platform/contracts";
+import { PlannerResultSchema, ResolutionResultSchema } from "@platform/contracts";
 import type { BuildContext, PromptBuilder, ResultExtractor, TurnType } from "@platform/llm-boundary";
-import { sha256Hex, toEngineValidationVerdict } from "@platform/llm-boundary";
+import { isAuthorProposalPathPrompt, sha256Hex, toEngineValidationVerdict } from "@platform/llm-boundary";
+import type { PersistenceStore } from "@platform/persistence";
 import type { WorkflowEngine } from "@platform/workflow-engine";
+import { snapshotCitations, verifyCitationsDetailed } from "./citations.js";
+import { loadCompletedResult } from "./completed-result.js";
+import {
+  persistApprovedProposalBinding,
+  readApprovedProposalBinding,
+} from "./proposal-integrity.js";
 import type { AgentRunner } from "./runner.js";
 import { ResumeTurnRegistry, type ResumableTurn } from "./resume.js";
 
@@ -19,6 +26,10 @@ export type TurnDeps = {
   writePrompts: boolean;
   newId: () => string;
   nowIso: () => string;
+  /** When set, planner citations are verified against this working tree. */
+  projectDir?: string;
+  /** Required for Author proposal binding on implementation turns. */
+  store?: PersistenceStore;
 };
 
 export type RunTurnInput = {
@@ -29,6 +40,14 @@ export type RunTurnInput = {
   context: BuildContext;
   iterationNumber?: number;
   inputObjectionIds?: readonly string[];
+  /** Pair: bind review to this immutable Author proposal. */
+  expectedProposalPath?: string;
+  expectedProposalHash?: string;
+  /**
+   * Persist approved_proposal binding as soon as the turn id exists (before
+   * agent dispatch), so TurnCompleted cannot race ahead of the binding.
+   */
+  approvedProposalBinding?: { proposalPath: string; proposalHash: string };
 };
 
 export type TurnOutcome =
@@ -51,6 +70,100 @@ function resolutionSemanticIssue(payload: unknown, targetTurnId?: string): strin
     return `Target turn ${targetTurnId} not found in verified list: ${resolution.verified.join(", ") || "(empty)"}`;
   }
   return null;
+}
+
+/** Propose/revise only. compacted_state_refresh also validates against
+ *  PlannerResultSchema but summarizes rather than plans, so citations are not verified. */
+function isPlannerTurn(turnType: TurnType): boolean {
+  return turnType === "planner_propose" || turnType === "planner_revise";
+}
+
+function validateArgsFromInput(
+  input: RunTurnInput,
+  promptVersion: string,
+  proposalOutputPath?: string,
+): {
+  promptVersion: string;
+  expectedProposalOutputPath?: string;
+  expectedProposalPath?: string;
+  expectedProposalHash?: string;
+} {
+  return {
+    promptVersion,
+    ...(proposalOutputPath ? { expectedProposalOutputPath: proposalOutputPath } : {}),
+    ...(input.expectedProposalPath ? { expectedProposalPath: input.expectedProposalPath } : {}),
+    ...(input.expectedProposalHash ? { expectedProposalHash: input.expectedProposalHash } : {}),
+  };
+}
+
+/**
+ * Author@1.8.0+: proposal file must exist at the declared path with non-whitespace content.
+ */
+function authorProposalFileIssue(promptVersion: string, payload: unknown): string | null {
+  if (!isAuthorProposalPathPrompt(promptVersion)) return null;
+  const parsed = PlannerResultSchema.safeParse(payload);
+  if (!parsed.success) return "planner payload failed schema validation";
+  const path = parsed.data.proposalPath;
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return `Author proposal file missing or unreadable at ${path}`;
+  }
+  if (!text.trim()) {
+    return `Author proposal file at ${path} is empty`;
+  }
+  return null;
+}
+
+/**
+ * Verify structured planner citations against the working tree. On success,
+ * snapshot the already-verified spans next to result.toon (single read — no
+ * re-verify). Returns null when skipped or all match; otherwise diagnostics.
+ */
+function plannerCitationIssue(
+  deps: TurnDeps,
+  turnType: TurnType,
+  payload: unknown,
+  resultPath: string,
+  options?: { skip?: boolean },
+): string | null {
+  if (options?.skip || !deps.projectDir || !isPlannerTurn(turnType)) return null;
+
+  const parsed = PlannerResultSchema.safeParse(payload);
+  if (!parsed.success) return "planner payload failed schema validation";
+
+  const citations = parsed.data.citations ?? [];
+  const detailed = verifyCitationsDetailed({ projectDir: deps.projectDir, citations });
+  if (!detailed.ok) return detailed.diagnostics;
+
+  if (detailed.verified.length > 0) {
+    snapshotCitations({
+      projectDir: deps.projectDir,
+      resultPath,
+      verified: detailed.verified,
+    });
+  }
+  return null;
+}
+
+function applyPostSchemaIssues(
+  turnType: TurnType,
+  promptVersion: string,
+  payload: unknown,
+  deps: TurnDeps,
+  resultPath: string,
+  input: RunTurnInput,
+  options?: { skipCitation?: boolean; skipProposalFile?: boolean },
+): string | null {
+  if (turnType === "resolution_verification") {
+    return resolutionSemanticIssue(payload, input.context.verificationTarget?.objectionId);
+  }
+  if (!options?.skipProposalFile) {
+    const proposalIssue = authorProposalFileIssue(promptVersion, payload);
+    if (proposalIssue) return proposalIssue;
+  }
+  return plannerCitationIssue(deps, turnType, payload, resultPath, { skip: options?.skipCitation });
 }
 
 /**
@@ -80,11 +193,18 @@ export async function runTurn(
 
   const turnId = deps.newId();
   const resultPath = join(deps.runsRoot, workflowId, iterationId, turnId, "result.toon");
+  const proposalOutputPath = isPlannerTurn(turnType)
+    ? join(dirname(resultPath), "proposal.md")
+    : undefined;
 
   const built = builder.build({
     turnType,
     identity: { workflowId, iterationId, turnId },
-    context: { ...input.context, resultPath },
+    context: {
+      ...input.context,
+      resultPath,
+      ...(proposalOutputPath ? { proposalOutputPath } : {}),
+    },
     write: deps.writePrompts,
   });
 
@@ -102,6 +222,19 @@ export async function runTurn(
     resultPath,
     ...(input.iterationNumber !== undefined ? { iterationNumber: input.iterationNumber } : {}),
   });
+  if (input.approvedProposalBinding) {
+    if (!deps.store) {
+      throw new Error("approvedProposalBinding requires TurnDeps.store");
+    }
+    persistApprovedProposalBinding(deps.store, {
+      workflowId,
+      iterationId,
+      turnId,
+      agentId,
+      proposalPath: input.approvedProposalBinding.proposalPath,
+      proposalHash: input.approvedProposalBinding.proposalHash,
+    });
+  }
   engine.markDelivered(turnId);
 
   const primary = await runner.deliver({
@@ -119,39 +252,73 @@ export async function runTurn(
     resultPath,
   });
 
-  signalResultSeen(deps, { workflowId, iterationId, turnId, agentId, resultPath, attempt: "primary", resultText: primary.resultText });
+  signalResultSeen(deps, {
+    workflowId,
+    iterationId,
+    turnId,
+    agentId,
+    resultPath,
+    attempt: "primary",
+    resultText: primary.resultText,
+  });
 
+  const validateExtra = validateArgsFromInput(input, built.promptVersion, proposalOutputPath);
   const primaryVerdict = extractor.validate({
     bytes: primary.resultText,
     turn: { workflowId, iterationId, turnId, nonce: built.nonce, turnType, attempt: "primary" },
     ...(input.inputObjectionIds ? { inputObjectionIds: input.inputObjectionIds } : {}),
+    ...validateExtra,
   });
 
-  // Resolution verification: a schema-valid result may still be semantically
-  // incomplete (wrong target, unresolved objections). Enforce before the engine
-  // commits the turn, so the bounded-repair path activates.
   let effectivePrimaryVerdict = primaryVerdict;
-  if (turnType === "resolution_verification" && primaryVerdict.outcome === "valid") {
-    const semanticIssue = resolutionSemanticIssue(primaryVerdict.payload, input.context.verificationTarget?.objectionId);
+  if (primaryVerdict.outcome === "valid") {
+    const semanticIssue = applyPostSchemaIssues(
+      turnType,
+      built.promptVersion,
+      primaryVerdict.payload,
+      deps,
+      resultPath,
+      input,
+    );
     if (semanticIssue) {
-      effectivePrimaryVerdict = { outcome: "needsRepair", reason: semanticIssue, diagnostics: semanticIssue };
+      effectivePrimaryVerdict = {
+        outcome: "needsRepair",
+        reason: semanticIssue,
+        diagnostics: semanticIssue,
+      };
     }
   }
 
   engine.applyValidation(toEngineValidationVerdict(turnId, effectivePrimaryVerdict));
 
   if (effectivePrimaryVerdict.outcome === "valid") {
-    return { status: "valid", turnId, role: effectivePrimaryVerdict.role, payload: effectivePrimaryVerdict.payload, resultHash: effectivePrimaryVerdict.resultHash };
+    return {
+      status: "valid",
+      turnId,
+      role: effectivePrimaryVerdict.role,
+      payload: effectivePrimaryVerdict.payload,
+      resultHash: effectivePrimaryVerdict.resultHash,
+    };
   }
   if (effectivePrimaryVerdict.outcome === "failed") {
     return { status: "failed", turnId, reason: effectivePrimaryVerdict.reason };
   }
 
-  // needsRepair: build the repair prompt with the original nonce and deliver once.
+  const repairReason =
+    effectivePrimaryVerdict.diagnostics &&
+    effectivePrimaryVerdict.diagnostics !== effectivePrimaryVerdict.reason
+      ? `${effectivePrimaryVerdict.reason}: ${effectivePrimaryVerdict.diagnostics}`
+      : effectivePrimaryVerdict.diagnostics || effectivePrimaryVerdict.reason;
   const repairBuilt = builder.build({
     turnType: "repair",
     identity: { workflowId, iterationId, turnId, nonce: built.nonce },
-    context: { ...input.context, resultPath, originalTurnType: turnType, repairReason: effectivePrimaryVerdict.reason },
+    context: {
+      ...input.context,
+      resultPath,
+      ...(proposalOutputPath ? { proposalOutputPath } : {}),
+      originalTurnType: turnType,
+      repairReason,
+    },
     write: deps.writePrompts,
   });
 
@@ -170,18 +337,33 @@ export async function runTurn(
     resultPath,
   });
 
-  signalResultSeen(deps, { workflowId, iterationId, turnId, agentId, resultPath, attempt: "repair", resultText: repair.resultText });
+  signalResultSeen(deps, {
+    workflowId,
+    iterationId,
+    turnId,
+    agentId,
+    resultPath,
+    attempt: "repair",
+    resultText: repair.resultText,
+  });
 
   const repairVerdict = extractor.validate({
     bytes: repair.resultText,
     turn: { workflowId, iterationId, turnId, nonce: built.nonce, turnType, attempt: "repair" },
     ...(input.inputObjectionIds ? { inputObjectionIds: input.inputObjectionIds } : {}),
+    ...validateExtra,
   });
 
-  // Same semantic override for repair: schema-valid but incomplete -> failed.
   let effectiveRepairVerdict = repairVerdict;
-  if (turnType === "resolution_verification" && repairVerdict.outcome === "valid") {
-    const semanticIssue = resolutionSemanticIssue(repairVerdict.payload, input.context.verificationTarget?.objectionId);
+  if (repairVerdict.outcome === "valid") {
+    const semanticIssue = applyPostSchemaIssues(
+      turnType,
+      built.promptVersion,
+      repairVerdict.payload,
+      deps,
+      resultPath,
+      input,
+    );
     if (semanticIssue) {
       effectiveRepairVerdict = { outcome: "failed", reason: semanticIssue };
     }
@@ -190,7 +372,13 @@ export async function runTurn(
   engine.applyValidation(toEngineValidationVerdict(turnId, effectiveRepairVerdict));
 
   if (effectiveRepairVerdict.outcome === "valid") {
-    return { status: "valid", turnId, role: effectiveRepairVerdict.role, payload: effectiveRepairVerdict.payload, resultHash: effectiveRepairVerdict.resultHash };
+    return {
+      status: "valid",
+      turnId,
+      role: effectiveRepairVerdict.role,
+      payload: effectiveRepairVerdict.payload,
+      resultHash: effectiveRepairVerdict.resultHash,
+    };
   }
   return { status: "failed", turnId, reason: effectiveRepairVerdict.reason };
 }
@@ -245,58 +433,95 @@ export async function adoptResumeCandidate(
   input: RunTurnInput,
   candidate: ResumableTurn,
 ): Promise<TurnOutcome> {
-  const { engine, extractor, builder, runner } = deps;
+  const { engine, extractor } = deps;
   const { turnType, workflowId, iterationId, agentId } = input;
 
-  // Validate that the candidate matches the current input.
   if (candidate.workflowId !== workflowId || candidate.iterationId !== iterationId || candidate.agentId !== agentId) {
     throw new Error(
       `Resume candidate mismatch: expected ${workflowId}/${iterationId}/${agentId}, ` +
-      `got ${candidate.workflowId}/${candidate.iterationId}/${candidate.agentId}.`,
+        `got ${candidate.workflowId}/${candidate.iterationId}/${candidate.agentId}.`,
     );
   }
 
-  // Try to read the artifact with a retry for the race window.
+  if (input.approvedProposalBinding) {
+    if (!deps.store) {
+      throw new Error("approvedProposalBinding requires TurnDeps.store");
+    }
+    const persisted = readApprovedProposalBinding(deps.store, workflowId, candidate.turnId);
+    if (!persisted) {
+      throw new Error(
+        `Durable state inconsistency: implementation turn ${candidate.turnId} has no approved_proposal binding.`,
+      );
+    }
+    const expected = input.approvedProposalBinding;
+    if (
+      persisted.proposalPath !== expected.proposalPath ||
+      persisted.proposalHash !== expected.proposalHash
+    ) {
+      throw new Error(
+        `Durable state inconsistency: implementation turn ${candidate.turnId} bound to ` +
+          `${persisted.proposalPath}@${persisted.proposalHash}, expected ` +
+          `${expected.proposalPath}@${expected.proposalHash}.`,
+      );
+    }
+  }
+
   const resultPath = candidate.resultPath;
   let resultBytes: string | null = null;
   let readError: NodeJS.ErrnoException | null = null;
-  for (let i = 0; i < 2; i++) {
-    readError = null;
-    try {
-      resultBytes = readFileSync(resultPath, "utf8");
-      break;
-    } catch (error) {
-      readError = error as NodeJS.ErrnoException;
-      if (readError.code !== "ENOENT") {
-        // Non-ENOENT errors (permissions, etc.) are final.
+  if (candidate.state === "completed") {
+    if (!deps.store) {
+      throw new Error(
+        `Durable state inconsistency: completed turn ${candidate.turnId} cannot be adopted without a PersistenceStore.`,
+      );
+    }
+    resultBytes = loadCompletedResult(deps.store, {
+      workflowId,
+      turnId: candidate.turnId,
+      resultPath,
+      identity: {
+        workflowId: candidate.workflowId,
+        iterationId: candidate.iterationId,
+        turnId: candidate.turnId,
+        nonce: candidate.nonce,
+      },
+    }).resultBytes;
+  } else {
+    for (let i = 0; i < 2; i++) {
+      readError = null;
+      try {
+        resultBytes = readFileSync(resultPath, "utf8");
         break;
+      } catch (error) {
+        readError = error as NodeJS.ErrnoException;
+        if (readError.code !== "ENOENT") {
+          break;
+        }
+        if (i === 0) await delay(250);
       }
-      // Wait briefly for a late write before the second attempt.
-      if (i === 0) await delay(250);
     }
   }
 
   if (resultBytes === null && readError) {
-    // Only ENOENT triggers the cancellation path; other errors propagate.
     if (readError.code !== "ENOENT") throw readError;
 
-    // Missing file for waiting/validating -> cancel old turn, create fresh one.
     if (candidate.state === "waiting" || candidate.state === "validating") {
       engine.cancelTurn(candidate.turnId);
       return runTurn(deps, input, null);
     }
-    // Completed-state corruption is a hard error.
     throw new Error(
       `Durable state inconsistency: completed turn ${candidate.turnId} result file missing at ${resultPath}.`,
     );
   }
 
-  // Validate the result bytes. Skip inputObjectionIds for completed planner
-  // turns: the cross-check applies to the current set of open objections, but
-  // a completed turn addressed the objections that were open at its time.
   const resultBytesSafe = resultBytes!;
-  const skipObjectionIdCheck = candidate.state === "completed" &&
-    (turnType === "planner_propose" || turnType === "planner_revise");
+  const skipObjectionIdCheck = candidate.state === "completed" && isPlannerTurn(turnType);
+  const skipCitationCheck = candidate.state === "completed" && isPlannerTurn(turnType);
+  // Skip existence/content re-check for completed Author turns (tree may drift),
+  // but never drop expectedProposalOutputPath — path equality stays for 1.8.0+.
+  const skipProposalFileCheck = candidate.state === "completed" && isPlannerTurn(turnType);
+  const proposalOutputPath = isPlannerTurn(turnType) ? join(dirname(resultPath), "proposal.md") : undefined;
+  const validateExtra = validateArgsFromInput(input, candidate.promptVersion, proposalOutputPath);
   const resultVerdict = extractor.validate({
     bytes: resultBytesSafe,
     turn: {
@@ -307,17 +532,24 @@ export async function adoptResumeCandidate(
       turnType,
       attempt: candidate.attempt,
     },
-    ...(input.inputObjectionIds && !skipObjectionIdCheck ? { inputObjectionIds: input.inputObjectionIds } : {}),
+    ...(input.inputObjectionIds && !skipObjectionIdCheck
+      ? { inputObjectionIds: input.inputObjectionIds }
+      : {}),
+    ...validateExtra,
   });
 
-  // Compute semantic validity for resolution_verification BEFORE any engine
-  // applyValidation, so waiting/validating candidates do not get committed as
-  // completed with an incomplete resolution.
   const extractorValid = resultVerdict.outcome === "valid";
-  const semanticIssue =
-    extractorValid && input.turnType === "resolution_verification"
-      ? resolutionSemanticIssue(resultVerdict.payload, input.context.verificationTarget?.objectionId)
-      : null;
+  const semanticIssue = extractorValid
+    ? applyPostSchemaIssues(
+        turnType,
+        candidate.promptVersion,
+        resultVerdict.payload,
+        deps,
+        resultPath,
+        input,
+        { skipCitation: skipCitationCheck, skipProposalFile: skipProposalFileCheck },
+      )
+    : null;
   const fullyValid = extractorValid && !semanticIssue;
 
   if (!fullyValid) {
@@ -327,20 +559,14 @@ export async function adoptResumeCandidate(
           `Durable state inconsistency: completed turn ${candidate.turnId} has an invalid result artifact.`,
         );
       }
-      // Schema-valid but semantically incomplete completed turn: bypass so a
-      // fresh verification can run instead of looping on the stale artifact.
       return runTurn(deps, input, null);
     }
 
     if (candidate.attempt === "primary") {
-      // The agent that produced the invalid result is gone on resume. Rather
-      // than sending a repair prompt to a fresh agent with no context, cancel
-      // the old turn and create a fresh primary turn with a new identity.
       engine.cancelTurn(candidate.turnId);
       return runTurn(deps, input, null);
     }
 
-    // Repair attempt: apply failure and return.
     if (candidate.state === "waiting") {
       signalResultSeen(deps, {
         workflowId: candidate.workflowId,
@@ -357,11 +583,13 @@ export async function adoptResumeCandidate(
       engine.applyValidation(toEngineValidationVerdict(candidate.turnId, resultVerdict));
       return { status: "failed", turnId: candidate.turnId, reason: resultVerdict.reason };
     }
-    engine.applyValidation(toEngineValidationVerdict(candidate.turnId, { outcome: "failed", reason: semanticIssue! }));
-    return { status: "failed", turnId: candidate.turnId, reason: semanticIssue! };
+    const failReason = semanticIssue!;
+    engine.applyValidation(
+      toEngineValidationVerdict(candidate.turnId, { outcome: "failed", reason: failReason }),
+    );
+    return { status: "failed", turnId: candidate.turnId, reason: failReason };
   }
 
-  // Fully valid (schema + semantics). Commit and return.
   if (candidate.state === "waiting") {
     signalResultSeen(deps, {
       workflowId: candidate.workflowId,
@@ -376,7 +604,6 @@ export async function adoptResumeCandidate(
   } else if (candidate.state === "validating") {
     engine.applyValidation(toEngineValidationVerdict(candidate.turnId, resultVerdict));
   }
-  // completed: return the validated outcome directly.
 
   return {
     status: "valid",
@@ -385,4 +612,9 @@ export async function adoptResumeCandidate(
     payload: resultVerdict.payload,
     resultHash: resultVerdict.resultHash,
   };
+}
+
+/** Hash proposal file bytes (SHA-256 hex). */
+export function hashProposalFile(path: string): string {
+  return sha256Hex(readFileSync(path));
 }

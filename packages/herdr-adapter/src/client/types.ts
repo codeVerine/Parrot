@@ -51,6 +51,13 @@ export type IntegrationStatus = {
   [key: string]: unknown;
 };
 
+/** Result of `tab.create`: the new tab and its empty root shell pane. */
+export type CreatedTab = {
+  tabId: string;
+  /** Empty shell pane created with the tab; reclaim after the first `agent.start` split. */
+  rootPaneId: string;
+};
+
 /** Wire params for `agent.start` (Herdr protocol 16 `AgentStartParams`). */
 export type AgentStartSpec = {
   name: string;
@@ -58,6 +65,8 @@ export type AgentStartSpec = {
   cwd?: string | null;
   workspace_id?: string | null;
   tab_id?: string | null;
+  /** When set, Herdr splits before spawning. When omitted with `tab_id`, Herdr 0.7.3 still defaults to `right`. */
+  split?: "right" | "down" | null;
   env?: Record<string, string>;
   focus?: boolean;
 };

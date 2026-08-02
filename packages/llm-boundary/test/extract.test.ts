@@ -361,3 +361,185 @@ test("adversarial_review zero objections without cleanRationale → needsRepair 
     assert.equal(verdict.reason, "evidence_rules");
   }
 });
+
+test("reviewer@1.2.0 clean review missing rich fields → needsRepair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: { role: "reviewer", objections: [], cleanRationale: "All criteria satisfied." },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+    promptVersion: "reviewer@1.2.0",
+    expectedProposalPath: "/runs/wf/proposal.md",
+    expectedProposalHash: "a".repeat(64),
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /reviewedProposalPath|summary/i);
+  }
+});
+
+test("reviewer@1.2.0 path/hash mismatch → needsRepair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      reviewedProposalPath: "/wrong/proposal.md",
+      reviewedProposalHash: "b".repeat(64),
+      summary: "Review summary.",
+      objections: [],
+      cleanRationale: "All criteria satisfied.",
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+    promptVersion: "reviewer@1.2.0",
+    expectedProposalPath: "/runs/wf/proposal.md",
+    expectedProposalHash: "a".repeat(64),
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /mismatch/i);
+  }
+});
+
+test("reviewer@1.2.0 objection without suggestedResolution → needsRepair", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      reviewedProposalPath: "/runs/wf/proposal.md",
+      reviewedProposalHash: "a".repeat(64),
+      summary: "Review summary.",
+      objections: [{ id: "OBJ-1", severity: "major", claim: "bad", evidence: ["src/a.ts:1"] }],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+    promptVersion: "reviewer@1.2.0",
+    expectedProposalPath: "/runs/wf/proposal.md",
+    expectedProposalHash: "a".repeat(64),
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /suggestedResolution/i);
+  }
+});
+
+test("reviewer@1.2.0 rich clean review with matching identity → valid", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      reviewedProposalPath: "/runs/wf/proposal.md",
+      reviewedProposalHash: "a".repeat(64),
+      summary: "Pair review: plan looks solid.",
+      objections: [],
+      cleanRationale: "All criteria satisfied.",
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "reviewer_review", attempt: "primary" },
+    promptVersion: "reviewer@1.2.0",
+    expectedProposalPath: "/runs/wf/proposal.md",
+    expectedProposalHash: "a".repeat(64),
+  });
+
+  assert.equal(verdict.outcome, "valid");
+});
+
+test("planner@1.8.0 revise must address every open objection exactly once", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    iterationId: "it-2",
+    turnId: "turn-2",
+    payload: {
+      role: "planner",
+      proposalPath: "/runs/wf/turn/proposal.md",
+      summary: "revised plan",
+      objectionsAddressed: [],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-2", turnId: "turn-2", nonce: "fixed-nonce-001", turnType: "planner_revise", attempt: "primary" },
+    promptVersion: "planner@1.8.0",
+    expectedProposalOutputPath: "/runs/wf/turn/proposal.md",
+    inputObjectionIds: ["OBJ-1", "OBJ-2"],
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /missing addressals/i);
+  }
+});
+
+test("planner@1.8.0 rejects legacy bare-ID addressal", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    iterationId: "it-2",
+    turnId: "turn-2",
+    payload: {
+      role: "planner",
+      proposalPath: "/runs/wf/turn/proposal.md",
+      summary: "revised plan",
+      objectionsAddressed: ["OBJ-1"],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-2", turnId: "turn-2", nonce: "fixed-nonce-001", turnType: "planner_revise", attempt: "primary" },
+    promptVersion: "planner@1.8.0",
+    expectedProposalOutputPath: "/runs/wf/turn/proposal.md",
+    inputObjectionIds: ["OBJ-1"],
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /legacy bare-ID/i);
+  }
+});
+
+test("planner@1.8.0 proposalPath must equal expected output path", () => {
+  const { extractor } = createBoundary();
+  const bytes = envelopeBytes({
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath: "/wrong/proposal.md",
+      summary: "plan",
+      objectionsAddressed: [],
+    },
+  });
+
+  const verdict = extractor.validate({
+    bytes,
+    turn: { workflowId: "wf-1", iterationId: "it-1", turnId: "turn-1", nonce: "fixed-nonce-001", turnType: "planner_propose", attempt: "primary" },
+    promptVersion: "planner@1.8.0",
+    expectedProposalOutputPath: "/runs/wf/turn/proposal.md",
+  });
+
+  assert.equal(verdict.outcome, "needsRepair");
+  if (verdict.outcome === "needsRepair") {
+    assert.match(verdict.diagnostics ?? "", /proposalPath must equal/i);
+  }
+});

@@ -1,11 +1,12 @@
 import { agentId, RuntimeSignalSchema, signalId, type AgentId, type RuntimeSignal, type TurnId } from "@platform/contracts";
+import { unlink } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { HerdrCli } from "./client/cli.js";
 import type { HerdrClient } from "./client/socket.js";
 import type { HerdrAgent } from "./client/types.js";
 import { withConfig, type AdapterConfig } from "./config.js";
 import { consumeEvent } from "./events.js";
-import { AgentSpawnError, AdapterError, ArtifactRejectedError, DegradedModeError, ProtocolMismatchError, ReconnectError, ResultWatchError, TurnDeliveryError } from "./errors.js";
+import { AgentSpawnError, AdapterError, ArtifactRejectedError, DegradedModeError, EnterNotAcknowledgedError, ProtocolMismatchError, ReconnectError, ResultWatchError, TurnDeliveryError } from "./errors.js";
 import { TurnDeadlineManager } from "./deadline.js";
 import { IdentityMap } from "./identity.js";
 import { Reconciler } from "./reconcile.js";
@@ -17,7 +18,7 @@ export type AgentSessionResume = { sessionId?: string | null; sessionPath?: stri
 export type AgentSpec = { id?: AgentId; provider: string; role: string; workspaceId: string; worktreeRequired: boolean; env?: Record<string, string>; argv?: string[]; cwd?: string; name?: string; tabId?: string; resume?: AgentSessionResume };
 export type AgentHandle = { id: AgentId; paneId: string; workflowId: string; provider: string; role: string; sessionId: string | null; sessionPath: string | null };
 export type TurnRequest = { turnId: TurnId; workflowId: string; iterationId: string; promptPath: string; promptHash: string; resultPath: string; schemaId: string; nonce: string; deadline: Date; idleMs?: number; attempt?: "primary" | "repair" };
-export type DeliveryReceipt = { turnId: TurnId; promptHash: string; deliveredAt: string };
+export type DeliveryReceipt = { turnId: TurnId; promptHash: string; deliveredAt: string; startConfirmed: boolean };
 export type TurnResult = SafeArtifact & { turnId: TurnId };
 export type StatusEvent = { agentId: AgentId | null; paneId: string; rawStatus: "idle" | "working" | "blocked" | "done" | "unknown"; normalizedStatus: NormalizedStatus; completionCandidate: boolean; resultCheckRequested: boolean };
 export type AgentStatus = { id: AgentId; paneId: string; status: NormalizedStatus; provider: string; role: string };
@@ -59,7 +60,18 @@ export interface AgentRuntime {
   stop(id: AgentId): Promise<void>;
 }
 
-type TurnContext = { agentId: AgentId; request: TurnRequest; watcher: ResultFileWatcher; sentAtMs: number; cancelled: boolean; repairUsed: boolean; resultSeen: boolean; resultRead: boolean };
+type TurnContext = {
+  agentId: AgentId;
+  request: TurnRequest;
+  watcher: ResultFileWatcher;
+  sentAtMs: number;
+  cancelled: boolean;
+  repairUsed: boolean;
+  resultSeen: boolean;
+  resultRead: boolean;
+  /** Re-arm the idle deadline up to the absolute turn cap (FS activity or live Herdr work). */
+  rearmIdle?: () => void;
+};
 type RuntimeOptions = { client: HerdrClient; cli?: HerdrCli; config?: Partial<AdapterConfig>; identity?: IdentityMap; startup?: StartupResult; persistedDeadlines?: Array<{ turnId: string; deadline: string; attempt: "primary" | "repair" }>; onSignal?: (signal: RuntimeSignal) => void };
 
 export class HerdrAgentRuntime implements AgentRuntime {
@@ -78,7 +90,11 @@ export class HerdrAgentRuntime implements AgentRuntime {
   constructor(private readonly options: RuntimeOptions) {
     this.config = withConfig(options.config);
     this.identity = options.identity ?? new IdentityMap();
-    this.deadlines = new TurnDeadlineManager((signal) => this.emitSignal(signal), options.persistedDeadlines ?? []);
+    this.deadlines = new TurnDeadlineManager(
+      (signal) => this.emitSignal(signal),
+      options.persistedDeadlines ?? [],
+      (turnId, deadline, attempt) => this.onIdleDeadline(turnId, deadline, attempt),
+    );
     this.reconciler = new Reconciler(options.client, this.identity, (signal) => this.emitSignal(signal), this.config, () => this.findMissedResults());
     if (options.startup?.degraded) this.emitSignal(degradedSignal(options.startup));
     this.subscribe();
@@ -154,10 +170,16 @@ export class HerdrAgentRuntime implements AgentRuntime {
   }
 
   async send(id: AgentId, turn: TurnRequest): Promise<DeliveryReceipt> {
-    const identity = this.identity.get(id);
     const attempt = turn.attempt ?? "primary";
-    if (!identity || !identity.paneId) throw this.deliveryFailure(new TurnDeliveryError("pane_dead", String(turn.turnId), attempt, "Agent pane is not available."));
+    // Snapshot paneId for delivery, but re-read status after prune: setStatus
+    // replaces the identity object, so a pre-prune binding can stay "blocked" /
+    // "working" even though cleanup already reset the map entry to idle.
+    const initial = this.identity.get(id);
+    if (!initial || !initial.paneId) throw this.deliveryFailure(new TurnDeliveryError("pane_dead", String(turn.turnId), attempt, "Agent pane is not available."));
+    const paneId = initial.paneId;
     if (attempt === "primary") this.pruneReadTurns(id);
+    const identity = this.identity.get(id);
+    if (!identity || !identity.paneId) throw this.deliveryFailure(new TurnDeliveryError("pane_dead", String(turn.turnId), attempt, "Agent pane is not available."));
     const key = this.turnKey(id, turn.turnId);
     const existing = this.turns.get(key);
     if (attempt === "repair") {
@@ -173,8 +195,9 @@ export class HerdrAgentRuntime implements AgentRuntime {
     const sentAtMs = Date.now();
     // Idle deadline: the turn's `deadline` is the absolute cap; when `idleMs` is set
     // the timer is armed at now+idleMs and re-armed (up to the cap) on every result-dir
-    // write, so a turn that keeps producing output is not killed by a fixed wall clock,
-    // while a truly silent agent still fails after idleMs. Absent idleMs preserves the
+    // write OR while Herdr still reports the agent as working/blocked, so a turn that
+    // keeps researching without writing files is not killed by silence alone.
+    // A truly silent+idle agent still fails after idleMs. Absent idleMs preserves the
     // old fixed-deadline behavior.
     const capMs = turn.deadline.getTime();
     const idleMs = turn.idleMs;
@@ -183,23 +206,59 @@ export class HerdrAgentRuntime implements AgentRuntime {
       const next = Math.min(Date.now() + idleMs, capMs);
       if (next > Date.now()) this.deadlines.arm(String(turn.turnId), new Date(next), attempt);
     };
+    // Drop the failed primary artifact so the repair watcher does not race a
+    // leftover result.toon whose mtime predates this send.
+    if (attempt === "repair") {
+      await unlink(turn.resultPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
     const watcher = new ResultFileWatcher(turn.resultPath, { turnDir: dirname(turn.resultPath), sentAtMs, maxBytes: this.config.artifactSizeLimitBytes, pollIntervalMs: this.config.pollIntervalMs, debounceMs: this.config.watchDebounceMs }, (signal) => this.emitSignal({ ...signal, workflowId: turn.workflowId, iterationId: turn.iterationId, turnId: String(turn.turnId), agentId: String(id) } as RuntimeSignal), rearmIdle);
     if (turn.deadline.getTime() > Date.now()) watcher.start();
     const command = `Read ${turn.promptPath} and write the ${turn.attempt === "repair" ? "repair " : ""}result to ${turn.resultPath}; schema=${turn.schemaId}; nonce=${turn.nonce}; promptHash=${turn.promptHash}`;
+    let startConfirmed = true;
     try {
-      await this.options.client.sendAgent(identity.paneId, command, turn.promptHash, this.config.operationTimeoutMs, this.options.cli);
+      await this.options.client.sendAgent(paneId, command, turn.promptHash, this.config.operationTimeoutMs, this.options.cli);
     } catch (error) {
-      watcher.stop();
-      throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), attempt, error instanceof Error ? error.message : String(error)));
+      if (error instanceof EnterNotAcknowledgedError) {
+        // The prompt text reached the pane; only the started-working confirmation
+        // is missing. Keep the watcher armed and let the result file (or the turn
+        // deadline) decide, since provider status detection can lag well past the
+        // operation timeout.
+        startConfirmed = false;
+      } else {
+        watcher.stop();
+        throw this.deliveryFailure(new TurnDeliveryError("transport_error", String(turn.turnId), attempt, error instanceof Error ? error.message : String(error)));
+      }
     }
     const context = this.turns.get(key);
-    if (context) { context.request = turn; context.sentAtMs = sentAtMs; context.repairUsed = true; context.resultSeen = false; context.resultRead = false; context.watcher.stop(); context.watcher = watcher; }
-    else this.turns.set(key, { agentId: id, request: turn, watcher, sentAtMs, cancelled: false, repairUsed: attempt === "repair", resultSeen: false, resultRead: false });
+    if (context) {
+      context.request = turn;
+      context.sentAtMs = sentAtMs;
+      context.repairUsed = true;
+      context.resultSeen = false;
+      context.resultRead = false;
+      context.watcher.stop();
+      context.watcher = watcher;
+      context.rearmIdle = rearmIdle;
+    } else {
+      this.turns.set(key, {
+        agentId: id,
+        request: turn,
+        watcher,
+        sentAtMs,
+        cancelled: false,
+        repairUsed: attempt === "repair",
+        resultSeen: false,
+        resultRead: false,
+        ...(rearmIdle ? { rearmIdle } : {}),
+      });
+    }
     this.identity.setStatus(id, "working");
     const initialDeadline = idleMs === undefined ? turn.deadline : new Date(Math.min(sentAtMs + idleMs, capMs));
     this.deadlines.arm(String(turn.turnId), initialDeadline, attempt);
     const remainingMs = turn.deadline.getTime() - Date.now();
-    if (remainingMs <= 0) return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString() };
+    if (remainingMs <= 0) return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString(), startConfirmed };
     void watcher.wait(remainingMs).then((artifact) => {
       const current = this.turns.get(key);
       if (current) current.resultSeen = true;
@@ -215,7 +274,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
         if (current) this.moveToOrphans(key, current, true);
       }
     });
-    return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString() };
+    return { turnId: turn.turnId, promptHash: turn.promptHash, deliveredAt: new Date(sentAtMs).toISOString(), startConfirmed };
   }
 
   async wait(id: AgentId, turnId: TurnId, timeoutMs: number): Promise<RuntimeSignal> {
@@ -321,6 +380,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
         const identity = signal.agentId ? this.identity.get(signal.agentId as AgentId) : undefined;
         const status: StatusEvent = { agentId: signal.agentId as AgentId | null, paneId: identity?.paneId ?? "", rawStatus: signal.rawStatus, normalizedStatus: signal.normalizedStatus, completionCandidate: signal.hints.completionCandidate, resultCheckRequested: signal.hints.resultCheckRequested };
         for (const handler of this.statusHandlers) handler(status);
+        if (signal.agentId) this.maybeRearmIdleFromStatus(signal.agentId as AgentId, signal.normalizedStatus);
       }
       this.emitSignal(signal);
     }));
@@ -331,6 +391,58 @@ export class HerdrAgentRuntime implements AgentRuntime {
     this.identity.updateFromHerdr(raw, normalized.normalizedStatus);
     const event: StatusEvent = { agentId: id, paneId: raw.pane_id, rawStatus: normalized.rawStatus, normalizedStatus: normalized.normalizedStatus, completionCandidate: normalized.completionCandidate, resultCheckRequested: normalized.resultCheckRequested };
     for (const handler of this.statusHandlers) handler(event);
+    this.maybeRearmIdleFromStatus(id, normalized.normalizedStatus);
+  }
+
+  /**
+   * Idle timer fired. If Herdr still shows the agent working/blocked, re-arm
+   * instead of emitting DeadlineExpired — agents often research for minutes
+   * without touching the turn directory.
+   */
+  private async onIdleDeadline(turnId: string, deadline: Date, attempt: "primary" | "repair"): Promise<void> {
+    const key = this.findTurnKey(turnId);
+    const context = key ? this.turns.get(key) : undefined;
+    if (!context || context.cancelled) {
+      this.deadlines.emitExpired(turnId, deadline, attempt);
+      return;
+    }
+    const idleMs = context.request.idleMs;
+    if (idleMs !== undefined) {
+      const live = await this.probeLiveStatus(context.agentId);
+      if (live === "working" || live === "blocked") {
+        const capMs = context.request.deadline.getTime();
+        const next = Math.min(Date.now() + idleMs, capMs);
+        if (next > Date.now()) {
+          this.deadlines.arm(turnId, new Date(next), attempt);
+          return;
+        }
+      }
+    }
+    this.deadlines.emitExpired(turnId, deadline, attempt);
+  }
+
+  private maybeRearmIdleFromStatus(agentId: AgentId, status: NormalizedStatus): void {
+    if (status !== "working" && status !== "blocked") return;
+    for (const context of this.turns.values()) {
+      if (context.agentId === agentId) context.rearmIdle?.();
+    }
+  }
+
+  private async probeLiveStatus(id: AgentId): Promise<NormalizedStatus | null> {
+    const identity = this.identity.get(id);
+    if (!identity?.paneId) return identity?.status ?? null;
+    try {
+      const agents = await this.options.client.listAgents(Math.min(this.config.operationTimeoutMs, 5_000));
+      const agent = agents.find((candidate) => candidate.pane_id === identity.paneId);
+      if (!agent) return null;
+      const normalized = normalizeStatus(agent, String(id));
+      this.identity.updateFromHerdr(agent, normalized.normalizedStatus);
+      return normalized.normalizedStatus;
+    } catch {
+      // Last-known map status is a weak fallback; prefer not to expire on a probe blip
+      // only when we still believe the agent is active.
+      return identity.status === "working" || identity.status === "blocked" ? identity.status : null;
+    }
   }
 
   private emitSignal(signal: RuntimeSignal) {

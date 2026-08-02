@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export const PERSISTED_TABLES = [
   "workflows",
@@ -227,6 +227,39 @@ export const MIGRATIONS: readonly string[] = [
     END;
   `,
   `ALTER TABLE workflows ADD COLUMN post_review_stage TEXT DEFAULT NULL;`,
+  `
+    -- Objection IDs are agent-minted short labels (OBJ-001, …) and collide across
+    -- workflows when objection_id is a global primary key. Scope them per workflow.
+    CREATE TABLE objections_v3 (
+      workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id),
+      objection_id TEXT NOT NULL,
+      iteration_id TEXT NOT NULL REFERENCES iterations(iteration_id),
+      turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+      dimension TEXT NOT NULL,
+      severity TEXT NOT NULL CHECK (severity IN ('blocking', 'major', 'minor')),
+      claim TEXT NOT NULL,
+      evidence_toon TEXT NOT NULL,
+      evidence_missing INTEGER NOT NULL CHECK (evidence_missing IN (0, 1)),
+      status TEXT NOT NULL,
+      raised_by TEXT NOT NULL,
+      cluster_id TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (workflow_id, objection_id)
+    );
+    INSERT INTO objections_v3 (
+      workflow_id, objection_id, iteration_id, turn_id, dimension, severity, claim,
+      evidence_toon, evidence_missing, status, raised_by, cluster_id, updated_at
+    )
+    SELECT
+      workflow_id, objection_id, iteration_id, turn_id, dimension, severity, claim,
+      evidence_toon, evidence_missing, status, raised_by, cluster_id, updated_at
+    FROM objections;
+    DROP TABLE objections;
+    ALTER TABLE objections_v3 RENAME TO objections;
+    CREATE INDEX objections_workflow_idx ON objections(workflow_id, status, severity);
+    CREATE INDEX objections_cluster_idx ON objections(cluster_id);
+  `,
+  `ALTER TABLE objections ADD COLUMN suggested_resolution TEXT DEFAULT NULL;`,
 ];
 
 export function schemaTables(): readonly PersistedTable[] { return PERSISTED_TABLES; }

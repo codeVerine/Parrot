@@ -17,6 +17,15 @@ export class ArtifactRejectedError extends AdapterError {
   static readonly signalKind = "ArtifactRejected";
   constructor(readonly reason: "symlink" | "ownership" | "world_writable" | "stale_mtime" | "path_escape" | "oversize", readonly artifactPath: string, readonly observed?: string, readonly limit?: string) { super(`Artifact rejected (${reason}): ${artifactPath}`, reason, "ArtifactRejected"); }
 }
+/**
+ * The prompt text reached the pane, but the agent never reported an active
+ * status within the confirmation window. Not an AdapterError: delivery likely
+ * succeeded, so callers should keep the result watcher armed instead of
+ * failing the turn.
+ */
+export class EnterNotAcknowledgedError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
 export class ReconnectError extends AdapterError { static readonly signalKind = "ReconnectFailed"; constructor(readonly attempts: number, message: string) { super(message, "reconnect_failed", "ReconnectFailed"); } }
 export class ProtocolMismatchError extends AdapterError { static readonly signalKind = "ProtocolMismatch"; constructor(readonly expectedProtocol: number, readonly observedProtocol: number | null, readonly expectedSchemaVersion: number, readonly observedSchemaVersion: number | null) { super(`Expected Herdr protocol ${expectedProtocol}/schema ${expectedSchemaVersion}, observed ${observedProtocol ?? "missing"}/${observedSchemaVersion ?? "missing"}.`, "protocol_mismatch", "ProtocolMismatch"); } }
 export class DegradedModeError extends AdapterError { static readonly signalKind = "DegradedModeEntered"; constructor(readonly missingIntegrations: string[], readonly disabledCapabilities: string[], message: string) { super(message, "degraded_mode", "DegradedModeEntered"); } }

@@ -144,14 +144,15 @@ onStalemate?: (ctx: {
 
 | Choice | Engine call | Result |
 |---|---|---|
-| `accept_mitigation` | `humanDecision({ decision: "approved", waiveOpenObjections: true })` | run continues into implementation |
-| `accept_objection` | `humanDecision({ decision: "rejected" })` | run ends rejected, plan is the record |
-| `abort` (default) | none | run ends `escalated` for offline review |
+| `1` / `accept_mitigation` | `humanDecision({ decision: "approved", waiveOpenObjections: true })` | run continues into implementation |
+| `2` / `accept_objection` | `continueAfterStalemate` (threshold +1, maxIterations +1, phase → `planner_turn`) | another planner→reviewer round; iteration count preserved |
+| `3` / `abort` (default) | none | run ends `escalated` for offline review |
 
-`reducePlanning` already accepts `humanDecision` from the `escalated` phase, so
-no new transition is needed. The CLI prints the report and prompts on the
-existing readline interface; the default when no resolver is supplied is
-`abort`, preserving current behavior for tests and non-interactive runs.
+CLI prompts use numbered options (`1`/`2`/`3`), not letter shortcuts.
+
+`reducePlanning` accepts `continueAfterStalemate` from the `escalated` phase. The
+durable event is `StalemateContinued`. The default when no resolver is supplied
+is `abort`, preserving current behavior for tests and non-interactive runs.
 
 `ReviewLoopResult` gains
 `escalation?: { reason: "objection_stalemate"; objectionIds: string[] }` so
@@ -161,7 +162,7 @@ callers can distinguish a stalemate stop from an iteration-cap stop.
 
 | Setting | Default | Effect |
 |---|---|---|
-| re-raise threshold | `1` | Fixed by design: exactly one failed mitigation attempt. Not configurable until a run shows a reason. |
+| `stalemateReraiseThreshold` | `1` | Open objections with `reraiseCount >= threshold` escalate. Each continue increments by 1. |
 | `escalationNotificationTarget` | existing | Reused; reason string is `objection_stalemate`. |
 
 ## 6. Test Plan
@@ -175,7 +176,8 @@ callers can distinguish a stalemate stop from an iteration-cap stop.
   2, reviewer re-raises in iteration 2 -> loop returns `escalated` with exactly
   two planner turns dispatched.
 - Override: `accept_mitigation` from `escalated` reaches `approved` with the
-  objection waived; `abort` leaves the workflow `escalated`.
+  objection waived; `accept_objection` bumps threshold and maxIterations and
+  returns to `planner_turn`; `abort` leaves the workflow `escalated`.
 - Report: contains claim, evidence, both turn IDs, and the resolution string.
 
 ## 7. Assigned Open Questions

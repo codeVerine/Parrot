@@ -17,6 +17,7 @@ export function initialFoldedState(workflowId: string): FoldedState {
     orphanLinks: [],
     budgetCapReached: false,
     iterationCapReached: false,
+    stalemateReraiseThreshold: 1,
   };
 }
 
@@ -145,6 +146,12 @@ export function foldReducer(state: FoldedState, event: PlatformEvent): FoldedSta
     }
     case "PlanChurnDetected": {
       setPhase(next, "escalated");
+      return next;
+    }
+    case "StalemateContinued": {
+      if (event.kind !== "StalemateContinued") return next;
+      next.stalemateReraiseThreshold = event.payload.newThreshold;
+      setPhase(next, "planner_turn");
       return next;
     }
     case "TurnCompleted":

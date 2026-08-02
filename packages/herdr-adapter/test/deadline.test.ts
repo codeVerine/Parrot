@@ -12,3 +12,26 @@ test("deadline emits a repair-scoped observation and can be re-derived", async (
   assert.equal(signals[0]?.attempt, "repair");
   manager.dispose();
 });
+
+test("onExpire can suppress DeadlineExpired by re-arming", async () => {
+  const signals: RuntimeSignal[] = [];
+  let fires = 0;
+  const manager = new TurnDeadlineManager(
+    (signal) => signals.push(signal),
+    [],
+    (turnId, _deadline, attempt) => {
+      fires += 1;
+      if (fires === 1) {
+        manager.arm(turnId, new Date(Date.now() + 15), attempt);
+        return;
+      }
+      manager.emitExpired(turnId, new Date(), attempt);
+    },
+  );
+  manager.arm("turn-rearm", new Date(Date.now() + 10), "primary");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(fires, 2);
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]?.kind, "DeadlineExpired");
+  manager.dispose();
+});

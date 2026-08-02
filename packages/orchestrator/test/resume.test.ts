@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -16,51 +16,59 @@ import {
   reuseImplementation,
   verificationCompleted,
   ResumeTurnRegistry,
+  buildResumeSeed,
+  rehydrateViews,
   type AgentTurnRequest,
 } from "../src/index.js";
-
-function envelope(req: AgentTurnRequest, role: string, payload: Record<string, unknown>): string {
-  return encodeToon({
-    workflowId: req.workflowId,
-    iterationId: req.iterationId,
-    turnId: req.turnId,
-    schemaVersion: "v1",
-    nonce: req.nonce,
-    role,
-    payload: { role, ...payload },
-  });
-}
+import { WorkflowEngine } from "@platform/workflow-engine";
+import { sha256Hex } from "@platform/llm-boundary";
+import {
+  authorEnvelope,
+  envelope,
+  pairClean,
+  pairObjections,
+  approvedProposal,
+} from "./author-pair-fixtures.js";
 
 function recordingResolver(
   runsRoot: string,
-  reply: (req: AgentTurnRequest) => { role: string; payload: Record<string, unknown> },
+  reply: (req: AgentTurnRequest, state: { proposalPath: string }) => { role: string; payload: Record<string, unknown> } | string,
   throwOn?: { turnType: string; once: boolean },
 ) {
   const delivered: string[] = [];
   let thrown = false;
+  const state = { proposalPath: "" };
   const resolver = (req: AgentTurnRequest): string => {
     delivered.push(req.turnType);
     if (throwOn && req.turnType === throwOn.turnType && !(throwOn.once && thrown)) {
       thrown = true;
       throw new Error(`simulated interruption on ${req.turnType}`);
     }
-    const { role, payload } = reply(req);
+    const result = reply(req, state);
+    if (typeof result === "string") {
+      mkdirSync(dirname(req.resultPath), { recursive: true });
+      writeFileSync(req.resultPath, result, "utf8");
+      return result;
+    }
+    const { role, payload } = result;
     const text = envelope(req, role, payload);
     mkdirSync(dirname(req.resultPath), { recursive: true });
     writeFileSync(req.resultPath, text, "utf8");
     return text;
   };
-  return { resolver, delivered };
+  return { resolver, delivered, state };
 }
 
-function reply(req: AgentTurnRequest): { role: string; payload: Record<string, unknown> } {
+function reply(req: AgentTurnRequest, state: { proposalPath: string }): string {
   if (req.turnType.startsWith("planner")) {
-    return { role: "planner", payload: { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] } };
+    const text = authorEnvelope(req, "ship the rate limiter");
+    state.proposalPath = join(dirname(req.resultPath), "proposal.md");
+    return text;
   }
   if (req.turnType.includes("review")) {
-    return { role: "reviewer", payload: { objections: [], cleanRationale: "All criteria satisfied." } };
+    return pairClean(req, state.proposalPath);
   }
-  return { role: "frontier", payload: { readiness: "ready", risks: [], questions: [] } };
+  return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
 }
 
 const loopInput = {
@@ -137,6 +145,24 @@ function baseTurn(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function appendTurnCompleted(
+  store: PersistenceStore,
+  turnId: string,
+  resultBytes: string,
+  identity: { workflowId?: string; iterationId?: string; agentId?: string } = {},
+): void {
+  store.appendEvent({
+    eventId: randomUUID(),
+    occurredAt: "2026-07-23T10:00:00.000Z",
+    workflowId: identity.workflowId ?? "w1",
+    iterationId: identity.iterationId ?? "i1",
+    turnId,
+    agentId: identity.agentId ?? "a1",
+    kind: "TurnCompleted",
+    payload: { resultHash: sha256Hex(resultBytes) },
+  });
+}
+
 test("resume continues from the interrupted phase without re-running completed turns", async () => {
   const runsRoot = mkdtempSync(join(tmpdir(), "parrot-resume-"));
   const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
@@ -152,11 +178,11 @@ test("resume continues from the interrupted phase without re-running completed t
   const second = recordingResolver(runsRoot, reply);
   const comp2 = composition(store, runsRoot, second.resolver, "b-");
   const seed = comp2.resumeWorkflow("workflow-1");
-  assert.equal(seed.finalProposalPath, "plan.md");
+  assert.ok(seed.finalProposalPath?.endsWith("proposal.md"));
 
   const result = await runReviewLoop(comp2, { ...loopInput, resume: seed });
   assert.equal(result.phase, "approved");
-  assert.equal(result.finalProposalPath, "plan.md");
+  assert.equal(result.finalProposalPath, seed.finalProposalPath);
 
   assert.deepEqual(
     second.delivered.filter((t) => t.startsWith("planner") || t.includes("review")),
@@ -169,11 +195,16 @@ test("resume rehydrates open objections raised before the interruption", async (
   const runsRoot = mkdtempSync(join(tmpdir(), "parrot-resume-obj-"));
   const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
 
-  const replyWithObjection = (req: AgentTurnRequest): { role: string; payload: Record<string, unknown> } => {
-    if (req.turnType.includes("review") && req.iterationId.endsWith("iter-1")) {
-      return { role: "reviewer", payload: { objections: [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }] } };
+  const replyWithObjection = (req: AgentTurnRequest, state: { proposalPath: string }): string => {
+    if (req.turnType.startsWith("planner")) {
+      const text = authorEnvelope(req, "ship the rate limiter");
+      state.proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
-    return reply(req);
+    if (req.turnType.includes("review") && req.iterationId.endsWith("iter-1")) {
+      return pairObjections(req, state.proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+    }
+    return reply(req, state);
   };
   const first = recordingResolver(runsRoot, replyWithObjection, { turnType: "planner_revise", once: true });
   const comp1 = composition(store, runsRoot, first.resolver, "c-");
@@ -255,11 +286,16 @@ test("missing result file for waiting turn falls back to fresh turn", async () =
     turnId: "old-waiting", nonce: "n1", resultPath: "/nonexistent.toon", state: "waiting",
   }));
 
-  const comp = adoptComp(store, (req) => encodeToon({
-    workflowId: req.workflowId, iterationId: req.iterationId, turnId: req.turnId,
-    schemaVersion: "v1", nonce: req.nonce, role: "planner",
-    payload: { role: "planner", proposalPath: "plan.md", summary: "s", objectionsAddressed: [] },
-  }), "missing");
+  const comp = adoptComp(store, (req) => {
+    const proposalPath = join(dirname(req.resultPath), "proposal.md");
+    mkdirSync(dirname(proposalPath), { recursive: true });
+    writeFileSync(proposalPath, "# Plan\n\ns\n", "utf8");
+    return encodeToon({
+      workflowId: req.workflowId, iterationId: req.iterationId, turnId: req.turnId,
+      schemaVersion: "v1", nonce: req.nonce, role: "planner",
+      payload: { role: "planner", proposalPath, summary: "s", objectionsAddressed: [] },
+    });
+  }, "missing");
   comp.startWorkflow({ workflowId: "w1", workspaceId: "ws1", task: "t" });
   comp.resumeWorkflow("w1"); // populate the resume registry
 
@@ -331,11 +367,14 @@ test("completed implementation and verification are both reusable after interrup
     nonceFactory: () => "post-review-nonce",
   });
   comp1.startWorkflow({ workflowId: "post-review", workspaceId: "ws1", task: "implement" });
+  const proposal = approvedProposal("post-review plan");
   const implementation = await comp1.runImplementation({
     workflowId: "post-review",
     iterationId: "post-review-impl",
     agentId: "implementation",
     task: "implement",
+    proposalPath: proposal.proposalPath,
+    proposalHash: proposal.proposalHash,
   });
   assert.equal(implementation.status, "completed");
   if (implementation.status !== "completed") return;
@@ -352,9 +391,262 @@ test("completed implementation and verification are both reusable after interrup
 
   // A fresh process/resume must reuse the implementation and recognize that its
   // already-complete verification does not need another verifier dispatch.
-  const reused = reuseImplementation(store, "post-review", "post-review-impl");
+  const reused = reuseImplementation(store, "post-review", "post-review-impl", {
+    proposalPath: proposal.proposalPath,
+    proposalHash: proposal.proposalHash,
+  });
   assert.deepEqual(reused, { turnId: implementation.turnId, summary: "implementation finished" });
   assert.equal(verificationCompleted(store, "post-review", "post-review-impl", implementation.turnId), true);
+});
+
+test("rehydrateViews restores addressal strategy and evidence from objection_addressal decisions", async () => {
+  let proposalPath = "";
+  const store = new PersistenceStore({ path: ":memory:" });
+  const comp = composition(
+    store,
+    mkdtempSync(join(tmpdir(), "parrot-rehydrate-addr-")),
+    (req) => {
+      if (req.turnType.startsWith("planner")) {
+        const addressed = req.iterationId.endsWith("iter-2")
+          ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "proposal.md:9 adds gate", requiresGuardrailException: false }]
+          : [];
+        const text = authorEnvelope(req, "ship the rate limiter", addressed);
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
+      }
+      if (req.turnType.includes("review")) {
+        if (req.iterationId.endsWith("iter-1")) {
+          return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+        }
+        return pairClean(req, proposalPath);
+      }
+      return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+    },
+    "addr-",
+  );
+  await runReviewLoop(comp, loopInput);
+
+  const views = rehydrateViews(store, "workflow-1");
+  const obj = views.get("OBJ-1");
+  assert.ok(obj, "OBJ-1 should be rehydrated");
+  assert.equal(obj?.addressal?.resolutionStrategy, "revised_plan");
+  assert.equal(obj?.addressal?.evidence, "proposal.md:9 adds gate");
+});
+
+test("buildResumeSeed throws when a Pair turn lacks suggestedResolution under reviewer@1.2.0", () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-multi-pair-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  const workflowId = "workflow-1";
+  const iterationId = `${workflowId}-iter-1`;
+  const proposalPath = join(runsRoot, "proposal.md");
+  writeFileSync(proposalPath, "# Plan\n\napproved\n");
+  const proposalHash = createHash("sha256").update("# Plan\n\napproved\n").digest("hex");
+
+  seedWorkflow(store, workflowId);
+  seedIteration(store, iterationId, workflowId);
+
+  const plannerResultPath = join(runsRoot, "planner.toon");
+  const plannerBytes = encodeToon({
+    workflowId,
+    iterationId,
+    turnId: "planner-1",
+    schemaVersion: "v1",
+    nonce: "nonce-p",
+    role: "planner",
+    payload: {
+      role: "planner",
+      proposalPath,
+      summary: "plan",
+      objectionsAddressed: [],
+    },
+  });
+  writeFileSync(plannerResultPath, plannerBytes);
+
+  const pair1ResultPath = join(runsRoot, "pair1.toon");
+  const pair1Bytes = encodeToon({
+    workflowId,
+    iterationId,
+    turnId: "pair-1",
+    schemaVersion: "v1",
+    nonce: "nonce-r1",
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      reviewedProposalPath: proposalPath,
+      reviewedProposalHash: proposalHash,
+      summary: "First pair review.",
+      objections: [{ id: "OBJ-1", severity: "major", claim: "bad", evidence: ["src/a.ts:1"] }],
+    },
+  });
+  writeFileSync(pair1ResultPath, pair1Bytes);
+
+  const pair2ResultPath = join(runsRoot, "pair2.toon");
+  const pair2Bytes = encodeToon({
+    workflowId,
+    iterationId,
+    turnId: "pair-2",
+    schemaVersion: "v1",
+    nonce: "nonce-r2",
+    role: "reviewer",
+    payload: {
+      role: "reviewer",
+      reviewedProposalPath: proposalPath,
+      reviewedProposalHash: proposalHash,
+      summary: "Second pair review.",
+      objections: [],
+      cleanRationale: "Looks good.",
+    },
+  });
+  writeFileSync(pair2ResultPath, pair2Bytes);
+
+  store.saveTurn(baseTurn({
+    turnId: "planner-1",
+    workflowId,
+    iterationId,
+    agentId: "agent-planner",
+    state: "completed",
+    nonce: "nonce-p",
+    promptVersion: "planner@1.8.0",
+    resultPath: plannerResultPath,
+  }));
+  store.saveTurn(baseTurn({
+    turnId: "pair-1",
+    workflowId,
+    iterationId,
+    agentId: "agent-reviewer-a",
+    state: "completed",
+    nonce: "nonce-r1",
+    promptVersion: "reviewer@1.2.0",
+    resultPath: pair1ResultPath,
+  }));
+  store.saveTurn(baseTurn({
+    turnId: "pair-2",
+    workflowId,
+    iterationId,
+    agentId: "agent-reviewer-b",
+    state: "completed",
+    nonce: "nonce-r2",
+    promptVersion: "reviewer@1.2.0",
+    resultPath: pair2ResultPath,
+  }));
+
+  for (const [turnId, bytes] of [
+    ["planner-1", plannerBytes],
+    ["pair-1", pair1Bytes],
+    ["pair-2", pair2Bytes],
+  ] as const) {
+    store.appendEvent({
+      eventId: randomUUID(),
+      occurredAt: "2026-07-23T10:00:00.000Z",
+      workflowId,
+      iterationId,
+      turnId,
+      agentId: turnId.startsWith("pair") ? "agent-reviewer" : "agent-planner",
+      kind: "TurnCompleted",
+      payload: { resultHash: sha256Hex(bytes) },
+    });
+  }
+
+  const engine = new WorkflowEngine({
+    store,
+    notifications: { notifyEscalation: () => undefined },
+  });
+  engine.startWorkflow({ workflowId, workspaceId: "ws1", task: "test" });
+
+  assert.throws(
+    () => buildResumeSeed(engine, store, workflowId),
+    /suggestedResolution|semantic validation/i,
+  );
+});
+
+test("resume fallback uses the newest older frontier and verifies its completion hash", () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-frontier-fallback-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  const workflowId = "fallback";
+  seedWorkflow(store, workflowId);
+
+  const saveCompleted = (input: {
+    iteration: number;
+    turnId: string;
+    agentId: string;
+    promptVersion: string;
+    role: string;
+    payload: Record<string, unknown>;
+  }) => {
+    const iterationId = `${workflowId}-iter-${input.iteration}`;
+    seedIteration(store, iterationId, workflowId);
+    const resultPath = join(runsRoot, `${input.turnId}.toon`);
+    const resultBytes = encodeToon({
+      workflowId,
+      iterationId,
+      turnId: input.turnId,
+      schemaVersion: "v1",
+      nonce: `nonce-${input.turnId}`,
+      role: input.role,
+      payload: { role: input.role, ...input.payload },
+    });
+    writeFileSync(resultPath, resultBytes, "utf8");
+    store.saveTurn(baseTurn({
+      turnId: input.turnId,
+      workflowId,
+      iterationId,
+      agentId: input.agentId,
+      state: "completed",
+      nonce: `nonce-${input.turnId}`,
+      promptVersion: input.promptVersion,
+      resultPath,
+    }));
+    appendTurnCompleted(store, input.turnId, resultBytes, {
+      workflowId,
+      iterationId,
+      agentId: input.agentId,
+    });
+    return { resultBytes, resultPath };
+  };
+
+  saveCompleted({
+    iteration: 1,
+    turnId: "frontier-1",
+    agentId: "frontier",
+    promptVersion: "frontier@1.0.0",
+    role: "frontier",
+    payload: { readiness: "ready", risks: [], questions: [] },
+  });
+  const newestFrontier = saveCompleted({
+    iteration: 2,
+    turnId: "frontier-2",
+    agentId: "frontier",
+    promptVersion: "frontier@1.0.0",
+    role: "frontier",
+    payload: { readiness: "not_ready", risks: [], questions: [] },
+  });
+  const proposalPath = join(runsRoot, "proposal.md");
+  writeFileSync(proposalPath, "# Plan\n\nCurrent proposal\n", "utf8");
+  saveCompleted({
+    iteration: 3,
+    turnId: "planner-3",
+    agentId: "planner",
+    promptVersion: "planner@1.8.0",
+    role: "planner",
+    payload: { proposalPath, summary: "current", objectionsAddressed: [] },
+  });
+
+  const engine = new WorkflowEngine({
+    store,
+    notifications: { notifyEscalation: () => undefined },
+  });
+  engine.startWorkflow({ workflowId, workspaceId: "ws1", task: "test" });
+  assert.equal(buildResumeSeed(engine, store, workflowId).frontierReadiness, "not_ready");
+
+  writeFileSync(
+    newestFrontier.resultPath,
+    newestFrontier.resultBytes.replace("not_ready", "ready"),
+    "utf8",
+  );
+  assert.throws(
+    () => buildResumeSeed(engine, store, workflowId),
+    /result bytes do not match TurnCompleted\.resultHash/i,
+  );
 });
 
 test("resume adoption preserves original turn identity for completed turn", async () => {
@@ -373,6 +665,7 @@ test("resume adoption preserves original turn identity for completed turn", asyn
   store.saveTurn(baseTurn({
     turnId: "completed-t1", nonce: "n1", resultPath, state: "completed",
   }));
+  appendTurnCompleted(store, "completed-t1", text);
 
   const comp = adoptComp(store, () => { throw new Error("should not be called"); }, "preserve");
   comp.startWorkflow({ workflowId: "w1", workspaceId: "ws1", task: "t" });
@@ -407,6 +700,7 @@ test("resume rehydrates a completed planner turn whose result.toon used the pre-
   store.saveTurn(baseTurn({
     turnId: "legacy-t1", nonce: "n1", resultPath, state: "completed",
   }));
+  appendTurnCompleted(store, "legacy-t1", text);
 
   const comp = adoptComp(store, () => { throw new Error("should not be called"); }, "legacy");
   comp.startWorkflow({ workflowId: "w1", workspaceId: "ws1", task: "t" });
@@ -554,15 +848,17 @@ test("completed semantically invalid resolution bypassed for fresh verification 
 
   const resultPath = join(tmpdir(), `parrot-compbad-${randomUUID()}`, "result.toon");
   mkdirSync(dirname(resultPath), { recursive: true });
-  writeFileSync(resultPath, encodeToon({
+  const staleResult = encodeToon({
     workflowId: "w1", iterationId: "i1", turnId: "bad-comp",
     schemaVersion: "v1", nonce: "n", role: "resolution",
     payload: { role: "resolution", verified: ["expected-target"], unresolved: ["OBJ-1"] },
-  }), "utf8");
+  });
+  writeFileSync(resultPath, staleResult, "utf8");
 
   store.saveTurn(baseTurn({
     turnId: "bad-comp", nonce: "n", resultPath, state: "completed",
   }));
+  appendTurnCompleted(store, "bad-comp", staleResult);
 
   // First resume: should bypass the stale completed turn and dispatch fresh.
   let calls1 = 0;
@@ -630,5 +926,167 @@ test("completed semantically invalid resolution bypassed for fresh verification 
   assert.ok(
     result2.status === "valid",
     "second resume should complete with valid status, not loop on stale artifact",
+  );
+});
+
+test("resume decision pairReviewSummaries match fresh run at human_decision", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-resume-pair-summaries-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+
+  let freshContext:
+    | { pairReviewSummaries?: Array<{ agentId: string; summary: string }> }
+    | undefined;
+  const pairSummary = "Resume parity pair summary marker";
+
+  const replyAtDecision = (req: AgentTurnRequest, state: { proposalPath: string }): string => {
+    if (req.turnType.startsWith("planner")) {
+      const text = authorEnvelope(req, "ship the rate limiter");
+      state.proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      const hash = createHash("sha256").update(readFileSync(state.proposalPath)).digest("hex");
+      return envelope(req, "reviewer", {
+        reviewedProposalPath: state.proposalPath,
+        reviewedProposalHash: hash,
+        summary: pairSummary,
+        objections: [],
+        cleanRationale: "All criteria satisfied.",
+      });
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  };
+
+  const first = recordingResolver(runsRoot, replyAtDecision);
+  const comp1 = composition(store, runsRoot, first.resolver, "pair-a-");
+  await assert.rejects(
+    runReviewLoop(comp1, {
+      ...loopInput,
+      decide: (ctx) => {
+        freshContext = ctx;
+        throw new Error("interrupt at human_decision");
+      },
+    }),
+    /interrupt at human_decision/,
+  );
+  assert.deepEqual(freshContext?.pairReviewSummaries, [{ agentId: "agent-reviewer", summary: pairSummary }]);
+
+  const compForSeed = composition(store, runsRoot, first.resolver, "pair-seed-");
+  const seed = compForSeed.resumeWorkflow("workflow-1");
+  assert.deepEqual(seed.pairReviewSummaries, freshContext?.pairReviewSummaries);
+
+  let resumeContext:
+    | { pairReviewSummaries?: Array<{ agentId: string; summary: string }> }
+    | undefined;
+  const second = recordingResolver(runsRoot, replyAtDecision);
+  const comp2 = composition(store, runsRoot, second.resolver, "pair-b-");
+  const result = await runReviewLoop(comp2, {
+    ...loopInput,
+    resume: seed,
+    decide: (ctx) => {
+      resumeContext = ctx;
+      return { decision: "approved" };
+    },
+  });
+  assert.equal(result.phase, "approved");
+  assert.deepEqual(resumeContext?.pairReviewSummaries, freshContext?.pairReviewSummaries);
+});
+
+test("tampered completed implementation result.toon throws on reuseImplementation", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-resume-tamper-impl-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  let counter = 0;
+  const resolver = (req: AgentTurnRequest): string => {
+    const text = envelope(req, "implementation", { status: "completed", summary: "implementation finished" });
+    mkdirSync(dirname(req.resultPath), { recursive: true });
+    writeFileSync(req.resultPath, text, "utf8");
+    return text;
+  };
+  const comp1 = createComposition({
+    store,
+    runner: createFixtureRunner(resolver),
+    humanSink: createMemorySink(),
+    runsRoot,
+    writePrompts: false,
+    newId: () => `post-review-turn-${++counter}`,
+    nonceFactory: () => "post-review-nonce",
+  });
+  comp1.startWorkflow({ workflowId: "post-review", workspaceId: "ws1", task: "implement" });
+  const proposal = approvedProposal("post-review plan");
+  const implementation = await comp1.runImplementation({
+    workflowId: "post-review",
+    iterationId: "post-review-impl",
+    agentId: "implementation",
+    task: "implement",
+    proposalPath: proposal.proposalPath,
+    proposalHash: proposal.proposalHash,
+  });
+  assert.equal(implementation.status, "completed");
+  if (implementation.status !== "completed") return;
+
+  const turn = store.getTurn(implementation.turnId);
+  writeFileSync(String(turn?.result_path), "tampered implementation bytes\n");
+
+  assert.throws(
+    () => reuseImplementation(store, "post-review", "post-review-impl", {
+      proposalPath: proposal.proposalPath,
+      proposalHash: proposal.proposalHash,
+    }),
+    /result bytes do not match TurnCompleted\.resultHash/i,
+  );
+});
+
+test("tampered verification result throws from verificationCompleted", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "parrot-resume-tamper-verify-"));
+  const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
+  let counter = 0;
+  const resolver = (req: AgentTurnRequest): string => {
+    const role = req.turnType === "implementation" ? "implementation" : "resolution";
+    const payload = role === "implementation"
+      ? { status: "completed", summary: "implementation finished" }
+      : { verified: ["post-review-turn-1"], unresolved: [] };
+    const text = envelope(req, role, payload);
+    mkdirSync(dirname(req.resultPath), { recursive: true });
+    writeFileSync(req.resultPath, text, "utf8");
+    return text;
+  };
+  const comp1 = createComposition({
+    store,
+    runner: createFixtureRunner(resolver),
+    humanSink: createMemorySink(),
+    runsRoot,
+    writePrompts: false,
+    newId: () => `post-review-turn-${++counter}`,
+    nonceFactory: () => "post-review-nonce",
+  });
+  comp1.startWorkflow({ workflowId: "post-review", workspaceId: "ws1", task: "implement" });
+  const proposal = approvedProposal("post-review plan");
+  const implementation = await comp1.runImplementation({
+    workflowId: "post-review",
+    iterationId: "post-review-impl",
+    agentId: "implementation",
+    task: "implement",
+    proposalPath: proposal.proposalPath,
+    proposalHash: proposal.proposalHash,
+  });
+  assert.equal(implementation.status, "completed");
+  if (implementation.status !== "completed") return;
+
+  const verification = await comp1.runVerification({
+    workflowId: "post-review",
+    iterationId: "post-review-impl",
+    agentId: "verifier",
+    targetTurnId: implementation.turnId,
+    summary: implementation.summary,
+    evidence: [],
+  });
+  assert.equal(verification.status, "valid");
+
+  const verifyTurn = store.getTurn(verification.turnId);
+  writeFileSync(String(verifyTurn?.result_path), "tampered verification bytes\n");
+
+  assert.throws(
+    () => verificationCompleted(store, "post-review", "post-review-impl", implementation.turnId),
+    /result bytes do not match TurnCompleted\.resultHash/i,
   );
 });

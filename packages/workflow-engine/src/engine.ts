@@ -18,6 +18,7 @@ import { enterFrontierReview, reducePlanning } from "./planning.js";
 import { reduceSignal } from "./signals.js";
 import { reduceTurn } from "./turn.js";
 import type {
+  ContinueAfterStalemateInput,
   EngineEffect,
   EscalationNotification,
   FoldedState,
@@ -587,6 +588,20 @@ export class WorkflowEngine {
     return result.state;
   }
 
+  /**
+   * Human chose "continue planning" after a stalemate / related escalation.
+   * Bumps maxIterations and stalemateReraiseThreshold by 1 each; returns to planner_turn
+   * without resetting iterationCount or per-objection reraiseCount.
+   */
+  continueAfterStalemate(input: ContinueAfterStalemateInput): FoldedState {
+    const config = this.configFor(input.workflowId);
+    const state = this.getState(input.workflowId);
+    const result = reducePlanning(state, config, { type: "continueAfterStalemate", input });
+    if (!result.accepted) throw new Error(result.reason ?? "continueAfterStalemate rejected");
+    this.commit(input.workflowId, result.state, result.effects);
+    return result.state;
+  }
+
   recover(workflowId: string): {
     state: FoldedState;
     pendingDeadlines: ReturnType<PersistenceStore["pendingDeadlines"]>;
@@ -631,6 +646,11 @@ export class WorkflowEngine {
       workflowId,
       seenIterationIds,
       objections: normalizeFoldedObjections((snapshot as Partial<FoldedState>).objections),
+      stalemateReraiseThreshold:
+        typeof (snapshot as Partial<FoldedState>).stalemateReraiseThreshold === "number" &&
+        (snapshot as Partial<FoldedState>).stalemateReraiseThreshold! >= 1
+          ? (snapshot as Partial<FoldedState>).stalemateReraiseThreshold!
+          : 1,
     };
     this.states.set(workflowId, state);
     return state;

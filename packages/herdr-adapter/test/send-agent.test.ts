@@ -86,13 +86,61 @@ test("socket fallback confirms paste and retries Enter until the agent acknowled
   assert.equal(client.readCount, 1, "paste confirmation should read the pane");
   assert.ok(client.waitCount > 1, "the fallback should keep polling before retrying Enter");
   assert.deepEqual(
-    transport.requests.map(({ method, params }) => ({ method, params })),
+    transport.requests
+      .filter(({ method }) => method === "pane.send_text" || method === "pane.send_keys")
+      .map(({ method, params }) => ({ method, params })),
     [
       { method: "pane.send_text", params: { pane_id: "pane-1", text: "prompt" } },
       { method: "pane.send_keys", params: { pane_id: "pane-1", keys: ["Enter"] } },
       { method: "pane.send_keys", params: { pane_id: "pane-1", keys: ["Enter"] } },
     ],
   );
+});
+
+class EventlessClient extends Protocol16SocketClient {
+  listCount = 0;
+  /** Live status flips to working after the first poll; no status event ever fires. */
+  workingAfterPolls = 1;
+
+  override async readPane(_paneId: string, _timeoutMs: number): Promise<PaneReadResult> {
+    return paneRead("prompt with PARROT-MARKER");
+  }
+
+  override async waitAgent(_paneId: string, _timeoutMs: number): Promise<HerdrAgent | null> {
+    return null;
+  }
+
+  override async listAgents(_timeoutMs: number): Promise<HerdrAgent[]> {
+    this.listCount += 1;
+    return [agent(this.listCount > this.workingAfterPolls ? "working" : "idle")];
+  }
+}
+
+test("Enter is acknowledged via live status polling when no status event fires", async () => {
+  const transport = new MockTransport();
+  const client = new EventlessClient(transport);
+
+  await client.sendAgent("pane-1", "prompt", "PARROT-MARKER", 5_000);
+
+  assert.ok(client.listCount > 1, "the live agent status should be polled");
+  const enters = transport.requests.filter(({ method }) => method === "pane.send_keys");
+  assert.ok(enters.length >= 1 && enters.length <= 3, "Enter presses stay bounded");
+});
+
+test("Enter confirmation uses the whole timeout budget before failing", async () => {
+  const transport = new MockTransport();
+  const client = new EventlessClient(transport);
+  client.workingAfterPolls = Number.POSITIVE_INFINITY;
+
+  const timeoutMs = 2_000;
+  const startedAt = Date.now();
+  await assert.rejects(
+    client.sendAgent("pane-1", "prompt", "PARROT-MARKER", timeoutMs),
+    /Enter not acknowledged/,
+  );
+  assert.ok(Date.now() - startedAt >= timeoutMs - 50, "the confirmation loop should not give up early");
+  const enters = transport.requests.filter(({ method }) => method === "pane.send_keys");
+  assert.equal(enters.length, 3, "Enter presses stay bounded at three attempts");
 });
 
 test("CLI pane.run presses Enter when the provider has not started", async () => {

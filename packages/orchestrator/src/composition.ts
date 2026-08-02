@@ -40,6 +40,8 @@ export type CompositionOptions = {
   deadlineMs?: number;
   /** Write prompt files to disk. Tests set false to stay in memory. */
   writePrompts?: boolean;
+  /** When set, planner citations are verified against this working tree. */
+  projectDir?: string;
   now?: () => string;
   newId?: () => string;
   nonceFactory?: () => string;
@@ -125,6 +127,8 @@ export function createComposition(options: CompositionOptions): Composition {
     writePrompts: options.writePrompts ?? true,
     newId: options.newId ?? (() => randomUUID()),
     nowIso: options.now ?? (() => new Date().toISOString()),
+    store: options.store,
+    ...(options.projectDir ? { projectDir: options.projectDir } : {}),
   };
 
   // Mutable resume registry - populated by resumeWorkflow(), consumed by runTurn().
@@ -152,6 +156,7 @@ export function createComposition(options: CompositionOptions): Composition {
             input.iterationNumber ??
             iterationNumberFor(options.store, input.workflowId, input.iterationId),
         },
+        options.store,
         resumeRegistry,
       );
       if (result.status === "completed") {

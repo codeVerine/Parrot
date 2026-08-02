@@ -1,4 +1,8 @@
 export {
+  CITATION_MAX_QUOTE_CHARS,
+  CITATION_MAX_SPAN_LINES,
+} from "./citation-limits.js";
+export {
   DEFAULT_LLM_BOUNDARY_CONFIG,
   roleForTurnType,
   withLlmBoundaryConfig,
@@ -18,6 +22,13 @@ export {
   stripEvidenceBlocks,
 } from "./evidence.js";
 export { newNonce, sha256Hex } from "./hash.js";
+export {
+  isAuthorCompleteAddressalPrompt,
+  isAuthorProposalPathPrompt,
+  isRichPairPrompt,
+  parsePromptVersion,
+  versionAtLeast,
+} from "./prompt-version.js";
 export { PromptBuilder } from "./prompts/builder.js";
 export {
   RolePromptRegistry,

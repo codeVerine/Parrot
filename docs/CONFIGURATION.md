@@ -26,6 +26,7 @@ The packaged CLI reads the following variables directly:
 | `PARROT_TURN_IDLE_TIMEOUT_MS` | milliseconds | Herdr runner default | Resets when agent activity is observed |
 | `PARROT_TURN_MAX_MS` | milliseconds | Herdr runner default | Absolute turn deadline |
 | `PARROT_TURN_TIMEOUT_MS` | milliseconds | unset | Deprecated alias used only when `PARROT_TURN_MAX_MS` is absent |
+| `PARROT_PERMISSION_MODE` | `project` \| `ask` \| `bypass` | `project` | `project` auto-approves work inside each agent's cwd / workspace; outside that tree Claude/Gemini still prompt and Codex sandbox-denies. `ask` uses stock CLI prompts. `bypass` skips all provider permission checks (aliases: `yolo`, `full`) |
 | `HERDR_BIN` | executable | `herdr` | Used for CLI operations and socket discovery |
 | `HERDR_SOCKET` | path | discovered/default socket | Highest-precedence socket selection |
 
@@ -86,6 +87,7 @@ The adapter pins protocol `16` and schema version `1`. Important defaults:
 
 - required integrations: `claude`, `codex`;
 - supported providers: `claude`, `codex`, `gemini`;
+- provider argv (permission mode `project`): Claude `--permission-mode acceptEdits`, Codex `--full-auto`, Gemini `--approval-mode auto_edit`;
 - turn deadline: 120 seconds;
 - grace timer: 5 seconds;
 - result artifact limit: 4 MiB;
@@ -95,8 +97,8 @@ The adapter pins protocol `16` and schema version `1`. Important defaults:
 - queued signals: 100;
 - retained orphan turns: 1,000.
 
-The packaged CLI's Herdr runner can override effective turn deadlines through the
-environment variables above.
+The packaged CLI selects provider argv from `PARROT_PERMISSION_MODE` and can
+override effective turn deadlines through the environment variables above.
 
 ## Persistence defaults
 

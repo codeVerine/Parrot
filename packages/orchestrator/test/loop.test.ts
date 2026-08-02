@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { encodeToon } from "@platform/contracts";
+import { createHash } from "node:crypto";
 import { PersistenceStore } from "@platform/persistence";
 import { createMemorySink } from "@platform/human-loop";
 import {
@@ -12,18 +12,12 @@ import {
   runReviewLoop,
   type AgentTurnRequest,
 } from "../src/index.js";
-
-function envelope(req: AgentTurnRequest, role: string, payload: Record<string, unknown>): string {
-  return encodeToon({
-    workflowId: req.workflowId,
-    iterationId: req.iterationId,
-    turnId: req.turnId,
-    schemaVersion: "v1",
-    nonce: req.nonce,
-    role,
-    payload: { role, ...payload },
-  });
-}
+import {
+  authorEnvelope,
+  envelope,
+  pairClean,
+  pairObjections,
+} from "./author-pair-fixtures.js";
 
 function setup(resolver: (req: AgentTurnRequest) => string) {
   const store = new PersistenceStore({ path: ":memory:" });
@@ -52,12 +46,15 @@ const loopInput = {
 
 test("clean loop reaches approved through the human gate", async () => {
   const progress: string[] = [];
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: [] });
+      const text = authorEnvelope(req, "ship the login rate limiter");
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      return envelope(req, "reviewer", { objections: [], cleanRationale: "All criteria satisfied." });
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -65,32 +62,32 @@ test("clean loop reaches approved through the human gate", async () => {
   const result = await runReviewLoop(comp, { ...loopInput, onProgress: (line) => progress.push(line) });
   assert.equal(result.phase, "approved");
   assert.equal(result.frontierReadiness, "ready");
-  assert.equal(result.finalProposalPath, "plan.md");
+  assert.equal(result.finalProposalPath, proposalPath);
   assert.deepEqual(progress, [
-    "[planner iter 1] ship the login rate limiter",
-    "[reviewer iter 1] objections=0, cleanRationale=present",
+    "[author iter 1] ship the login rate limiter",
+    "[pair iter 1] objections=0, cleanRationale=present",
     "[frontier iter 1] readiness=ready, risks=0, questions=0",
   ]);
 });
 
 test("reviewer objection forces a revise, then converges to approved", async () => {
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const isIter2 = req.iterationId.endsWith("iter-2");
       const addressed = isIter2
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
       const onIter1 = req.iterationId.endsWith("iter-1");
-      const objections = onIter1
-        ? [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]
-        : [];
-      const payload = onIter1
-        ? { objections }
-        : { objections: [], cleanRationale: "All criteria satisfied." };
-      return envelope(req, "reviewer", payload);
+      if (onIter1) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -102,12 +99,15 @@ test("reviewer objection forces a revise, then converges to approved", async () 
 });
 
 test("blocking frontier finding converts to an objection and re-enters the loop", async () => {
+  let proposalPath = "";
   const { store, comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: [] });
+      const text = authorEnvelope(req, "ship the login rate limiter");
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      return envelope(req, "reviewer", { objections: [], cleanRationale: "All criteria satisfied." });
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "not_ready", risks: ["unmitigated deploy risk"], questions: [] });
   });
@@ -123,6 +123,7 @@ test("blocking frontier finding converts to an objection and re-enters the loop"
 
 test("objection stalemate escalates without a resolver: reviewer re-raises after the planner's addressal", async () => {
   let plannerTurns = 0;
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       plannerTurns += 1;
@@ -130,12 +131,12 @@ test("objection stalemate escalates without a resolver: reviewer re-raises after
       const addressed = isIter2
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      return envelope(req, "reviewer", {
-        objections: [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }],
-      });
+      return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -148,19 +149,22 @@ test("objection stalemate escalates without a resolver: reviewer re-raises after
 
 test("planner-conceded addressal escalates as a guardrail conflict and skips the reviewer round it would have triggered", async () => {
   let reviewerTurns = 0;
+  let proposalPath = "";
   const { store, comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const addressed = req.iterationId.endsWith("iter-2")
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "conceded" as const, evidence: "every gate needs a forbidden schema change", requiresGuardrailException: false }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
       reviewerTurns += 1;
-      const objections = req.iterationId.endsWith("iter-1")
-        ? [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]
-        : [];
-      return envelope(req, "reviewer", { objections });
+      if (req.iterationId.endsWith("iter-1")) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -177,18 +181,21 @@ test("planner-conceded addressal escalates as a guardrail conflict and skips the
 });
 
 test("requiresGuardrailException on a revised_plan addressal also escalates as a guardrail conflict", async () => {
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const addressed = req.iterationId.endsWith("iter-2")
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "would need a persisted field the guardrails forbid", requiresGuardrailException: true }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      const objections = req.iterationId.endsWith("iter-1")
-        ? [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]
-        : [];
-      return envelope(req, "reviewer", { objections });
+      if (req.iterationId.endsWith("iter-1")) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -198,44 +205,61 @@ test("requiresGuardrailException on a revised_plan addressal also escalates as a
   assert.deepEqual(result.escalation, { reason: "guardrail_conflict", objectionIds: ["OBJ-1"] });
 });
 
-test("guardrail conflict: accept_objection resolver ends the run rejected", async () => {
+test("guardrail conflict: accept_objection continues planning instead of rejecting", async () => {
+  let plannerTurns = 0;
+  let stalemateCalls = 0;
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
+      plannerTurns += 1;
       const addressed = req.iterationId.endsWith("iter-2")
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "conceded" as const, evidence: "no verifiable gate exists", requiresGuardrailException: false }]
-        : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+        : req.iterationId.endsWith("iter-3")
+          ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "proposal.md:9 adds a gate", requiresGuardrailException: false }]
+          : [];
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      const objections = req.iterationId.endsWith("iter-1")
-        ? [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]
-        : [];
-      return envelope(req, "reviewer", { objections });
+      if (req.iterationId.endsWith("iter-1") || req.iterationId.endsWith("iter-2")) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "blocking", claim: "no gate can verify this", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
 
-  const result = await runReviewLoop(comp, { ...loopInput, onStalemate: () => "accept_objection" });
-  assert.equal(result.phase, "rejected");
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    maxIterations: 5,
+    onStalemate: () => {
+      stalemateCalls += 1;
+      // First escalation is the guardrail conflict; continue planning.
+      if (stalemateCalls === 1) return "accept_objection";
+      return "accept_mitigation";
+    },
+  });
+  assert.notEqual(result.phase, "rejected");
+  assert.ok(plannerTurns >= 3, `expected at least 3 planner turns after continue, got ${plannerTurns}`);
 });
 
 test("clean revised_plan addressal resolves the objection and proceeds to review, persisting one decision row", async () => {
+  let proposalPath = "";
   const { store, comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const addressed = req.iterationId.endsWith("iter-2")
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "proposal.md:9 now validates ownership before delete", requiresGuardrailException: false }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      const onIter1 = req.iterationId.endsWith("iter-1");
-      const objections = onIter1
-        ? [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]
-        : [];
-      const payload = onIter1
-        ? { objections }
-        : { objections: [], cleanRationale: "All criteria satisfied." };
-      return envelope(req, "reviewer", payload);
+      if (req.iterationId.endsWith("iter-1")) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -248,19 +272,112 @@ test("clean revised_plan addressal resolves the objection and proceeds to review
   assert.equal(String(addressalDecisions[0]?.chosen), "revised_plan");
 });
 
+test("objection stalemate: accept_objection continues another planner round", async () => {
+  let plannerTurns = 0;
+  let stalemateCalls = 0;
+  let proposalPath = "";
+  const { comp } = setup((req) => {
+    if (req.turnType.startsWith("planner")) {
+      plannerTurns += 1;
+      const isIter2 = req.iterationId.endsWith("iter-2");
+      const isIter3 = req.iterationId.endsWith("iter-3");
+      const addressed = isIter2 || isIter3
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
+        : [];
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      if (req.iterationId.endsWith("iter-3")) {
+        return pairClean(req, proposalPath);
+      }
+      return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    maxIterations: 5,
+    onStalemate: () => {
+      stalemateCalls += 1;
+      return "accept_objection";
+    },
+  });
+  assert.equal(stalemateCalls, 1);
+  assert.notEqual(result.phase, "rejected");
+  assert.equal(result.phase, "approved");
+  assert.ok(plannerTurns >= 3, `expected at least 3 planner turns, got ${plannerTurns}`);
+  assert.deepEqual(result.humanMessages, []);
+});
+
+test("stalemate continue with guidance injects humanMessages into next planner revise", async () => {
+  const seen: AgentTurnRequest[] = [];
+  let stalemateCalls = 0;
+  let proposalPath = "";
+  const { store, comp } = setup((req) => {
+    seen.push(req);
+    if (req.turnType.startsWith("planner")) {
+      const isIter2 = req.iterationId.endsWith("iter-2");
+      const isIter3 = req.iterationId.endsWith("iter-3");
+      const addressed = isIter2 || isIter3
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
+        : [];
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      if (req.iterationId.endsWith("iter-3")) {
+        return pairClean(req, proposalPath);
+      }
+      return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const guidance = "Stop exhaustive prose tables; use machine-ratchet inventory files.";
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    maxIterations: 5,
+    onStalemate: () => {
+      stalemateCalls += 1;
+      return { choice: "accept_objection" as const, guidance };
+    },
+  });
+
+  assert.equal(stalemateCalls, 1);
+  assert.equal(result.phase, "approved");
+  assert.deepEqual(result.humanMessages, [{ afterIteration: 2, message: guidance }]);
+
+  const feedback = store.listHumanFeedback("workflow-1");
+  assert.equal(feedback.length, 1);
+  assert.equal(String(feedback[0]?.decision), "stalemate_continue");
+  assert.equal(String(feedback[0]?.comment), guidance);
+
+  const reviseAfterContinue = seen.find(
+    (req) => req.turnType === "planner_revise" && req.iterationId.endsWith("iter-3") && req.attempt === "primary",
+  );
+  assert.ok(reviseAfterContinue, "expected planner_revise on iter-3");
+  assert.match(reviseAfterContinue.promptContent, /## Human guidance/);
+  assert.match(reviseAfterContinue.promptContent, /machine-ratchet inventory files/);
+});
+
 test("objection stalemate: accept_mitigation resolver waives the objection and continues to approved", async () => {
+  let proposalPath = "";
   const { comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const isIter2 = req.iterationId.endsWith("iter-2");
       const addressed = isIter2
         ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
         : [];
-      return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the login rate limiter", objectionsAddressed: addressed });
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
     }
     if (req.turnType.includes("review")) {
-      return envelope(req, "reviewer", {
-        objections: [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }],
-      });
+      return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
@@ -273,12 +390,54 @@ test("objection stalemate: accept_mitigation resolver waives the objection and c
   assert.equal(result.phase, "approved");
 });
 
+test("planner revise prompt includes Author proposal context and prior summary", async () => {
+  const seen: AgentTurnRequest[] = [];
+  let firstProposalPath = "";
+  let secondProposalPath = "";
+  const { comp } = setup((req) => {
+    seen.push(req);
+    if (req.turnType.startsWith("planner")) {
+      const isRevise = req.turnType === "planner_revise";
+      const addressed = isRevise
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "proposal.md:1 fixed", requiresGuardrailException: false }]
+        : [];
+      const summary = isRevise ? "revised login rate limiter" : "ship the login rate limiter";
+      const text = authorEnvelope(req, summary, addressed);
+      if (isRevise) {
+        secondProposalPath = join(dirname(req.resultPath), "proposal.md");
+      } else {
+        firstProposalPath = join(dirname(req.resultPath), "proposal.md");
+      }
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      if (req.iterationId.endsWith("iter-1")) {
+        return pairObjections(req, firstProposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, secondProposalPath || firstProposalPath);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const result = await runReviewLoop(comp, loopInput);
+  assert.equal(result.phase, "approved");
+  const revise = seen.find((req) => req.turnType === "planner_revise" && req.attempt === "primary");
+  assert.ok(revise, "expected a planner_revise delivery");
+  assert.match(revise.promptContent, /## Proposal path/);
+  assert.match(revise.promptContent, /proposal\.md/);
+  assert.match(revise.promptContent, /## Proposal output path/);
+  assert.match(revise.promptContent, /## Proposal summary/);
+  assert.match(revise.promptContent, /ship the login rate limiter/);
+  assert.match(revise.promptContent, /suggestedResolution/i);
+});
+
 test("frontier re-invoke: restructured proposal with open objections dispatches mid-loop frontier", async () => {
   const runsRoot = mkdtempSync(join(tmpdir(), "parrot-frontier-re-"));
   const store = new PersistenceStore({ path: join(runsRoot, "parrot.db") });
 
   let plannerIter = 0;
   let frontierTurns = 0;
+  let lastProposalPath = "";
   const fileResolver = (req: AgentTurnRequest): string => {
     if (req.turnType.startsWith("planner")) {
       plannerIter++;
@@ -288,13 +447,23 @@ test("frontier re-invoke: restructured proposal with open objections dispatches 
       const proposalPath = join(runsRoot, `proposal-iter${plannerIter}.md`);
       mkdirSync(dirname(proposalPath), { recursive: true });
       writeFileSync(proposalPath, `${headings}\n\nbody`, "utf8");
-      const text = envelope(req, "planner", { proposalPath, summary: `iter ${plannerIter}`, objectionsAddressed: [] });
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, `${headings}\n\nbody`, "utf8");
+      lastProposalPath = turnProposalPath;
+      const text = envelope(req, "planner", {
+        proposalPath: turnProposalPath,
+        summary: `iter ${plannerIter}`,
+        objectionsAddressed: plannerIter >= 2
+          ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "proposal.md:1 adds gate", requiresGuardrailException: false }]
+          : [],
+      });
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
     }
     if (req.turnType.includes("review")) {
-      const text = envelope(req, "reviewer", { objections: [{ id: "OBJ-1", severity: "major", claim: "no gate", evidence: ["a.ts:1"] }] });
+      const text = pairObjections(req, lastProposalPath, [{ id: "OBJ-1", severity: "major", claim: "no gate", evidence: ["a.ts:1"] }]);
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
@@ -347,17 +516,19 @@ test("frontier re-invoke: disabled config dispatches none mid-loop", async () =>
 
   let plannerIter = 0;
   let midLoopFrontier = false;
+  let lastProposalPath = "";
   const fileResolver = (req: AgentTurnRequest): string => {
     if (req.turnType.startsWith("planner")) {
       plannerIter++;
       const headings = plannerIter === 1
         ? "## Overview\n## Implementation"
         : "## Overview\n## Architecture\n## Deployment\n## Rollback\n## Risks";
-      const proposalPath = join(runsRoot, `proposal-iter${plannerIter}.md`);
-      mkdirSync(dirname(proposalPath), { recursive: true });
-      writeFileSync(proposalPath, `${headings}\n\nbody`, "utf8");
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, `${headings}\n\nbody`, "utf8");
+      lastProposalPath = turnProposalPath;
       const text = envelope(req, "planner", {
-        proposalPath,
+        proposalPath: turnProposalPath,
         summary: `iter ${plannerIter}`,
         objectionsAddressed: plannerIter >= 2 ? [{ objectionId: `OBJ-${plannerIter - 1}`, resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }] : [],
       });
@@ -367,7 +538,7 @@ test("frontier re-invoke: disabled config dispatches none mid-loop", async () =>
     }
     if (req.turnType.includes("review")) {
       const objId = `OBJ-${plannerIter}`;
-      const text = envelope(req, "reviewer", { objections: [{ id: objId, severity: "major", claim: `issue ${plannerIter}`, evidence: ["a.ts:1"] }] });
+      const text = pairObjections(req, lastProposalPath, [{ id: objId, severity: "major", claim: `issue ${plannerIter}`, evidence: ["a.ts:1"] }]);
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
@@ -410,14 +581,16 @@ test("frontier re-invoke: identical proposals dispatch no mid-loop frontier", as
 
   let plannerIter = 0;
   let midLoopFrontier = false;
+  let lastProposalPath = "";
   const fileResolver = (req: AgentTurnRequest): string => {
     if (req.turnType.startsWith("planner")) {
       plannerIter++;
-      const proposalPath = join(runsRoot, `proposal-iter${plannerIter}.md`);
-      mkdirSync(dirname(proposalPath), { recursive: true });
-      writeFileSync(proposalPath, "## Overview\nSame content every time.\n## Testing", "utf8");
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, "## Overview\nSame content every time.\n## Testing", "utf8");
+      lastProposalPath = turnProposalPath;
       const text = envelope(req, "planner", {
-        proposalPath,
+        proposalPath: turnProposalPath,
         summary: `iter ${plannerIter}`,
         objectionsAddressed: plannerIter >= 2 ? [{ objectionId: `OBJ-${plannerIter - 1}`, resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }] : [],
       });
@@ -427,7 +600,7 @@ test("frontier re-invoke: identical proposals dispatch no mid-loop frontier", as
     }
     if (req.turnType.includes("review")) {
       const objId = `OBJ-${plannerIter}`;
-      const text = envelope(req, "reviewer", { objections: [{ id: objId, severity: "major", claim: `issue ${plannerIter}`, evidence: ["a.ts:1"] }] });
+      const text = pairObjections(req, lastProposalPath, [{ id: objId, severity: "major", claim: `issue ${plannerIter}`, evidence: ["a.ts:1"] }]);
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
@@ -465,50 +638,32 @@ test("frontier re-invoke: identical proposals dispatch no mid-loop frontier", as
 });
 
 test("legacy bare-ID addressal targeting a genuinely open objection is filtered, not persisted", async () => {
-  // A pre-Phase-10 result.toon used a bare objection ID string in
-  // objectionsAddressed. The schema normalizes the bare string into a
-  // synthetic structured addressal with a non-enumerable `__legacy`
-  // marker, an empty evidence string, and a default `revised_plan`
-  // strategy. The loop must NOT persist it as a real decision (it would
-  // show up as `revised_plan / (no evidence)`, polluting the durable
-  // trail), and must NOT resolve an open objection on its word (the
-  // planner never actually addressed it).
-  //
-  // Scenario: iter 1 reviewer raises OBJ-1. iter 2 planner attempts a
-  // legacy bare-ID addressal for OBJ-1. Without the legacy filter, the
-  // existing `views.has(...) && status === "open"` check would let this
-  // through (OBJ-1 is genuinely open), and the loop would persist a
-  // `revised_plan / (no evidence)` decision and silently resolve the
-  // open objection. The `__legacy` marker must suppress that path.
+  // Author@1.8.0+ rejects legacy bare-ID addressals at validation time.
+  // The loop must NOT persist them as objection_addressal decisions.
+  let proposalPath = "";
   const { store, comp } = setup((req) => {
     if (req.turnType.startsWith("planner")) {
       const isFirst = req.iterationId.endsWith("iter-1");
-      // iter 1: no addressals (no objection has been raised yet).
-      // iter 2: a legacy bare-ID entry for OBJ-1, which is the objection
-      // the iter-1 reviewer raised. The entry should be ignored.
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, "# Plan\n\nship the rate limiter\n", "utf8");
+      proposalPath = turnProposalPath;
       const payload = isFirst
-        ? { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] }
-        : { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: ["OBJ-1"] };
+        ? { proposalPath: turnProposalPath, summary: "ship the rate limiter", objectionsAddressed: [] }
+        : { proposalPath: turnProposalPath, summary: "ship the rate limiter", objectionsAddressed: ["OBJ-1"] };
       return envelope(req, "planner", payload);
     }
     if (req.turnType.includes("review")) {
-      const onIter1 = req.iterationId.endsWith("iter-1");
-      const objections = onIter1
-        ? [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]
-        : [];
-      const payload = onIter1
-        ? { objections }
-        : { objections: [], cleanRationale: "All criteria satisfied." };
-      return envelope(req, "reviewer", payload);
+      if (req.iterationId.endsWith("iter-1")) {
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+      }
+      return pairClean(req, proposalPath);
     }
     return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
   });
 
-  // The loop escalates at iteration cap because the legacy addressal
-  // cannot resolve OBJ-1. The assertion is on the persisted decisions,
-  // not the final phase: the legacy bare-ID addressal must NOT have been
-  // recorded as an `objection_addressal` decision row.
-  await runReviewLoop(comp, { ...loopInput, maxIterations: 2 });
+  const result = await runReviewLoop(comp, { ...loopInput, maxIterations: 2 });
+  assert.notEqual(result.phase, "approved");
   const addressalDecisions = store.readRows("decisions").filter((row) => String(row.decision) === "objection_addressal");
   assert.equal(
     addressalDecisions.length,
@@ -526,14 +681,17 @@ test("notification: abort re-emits one escalation notification through the confi
   const sink = createMemorySink();
   const store = new PersistenceStore({ path: ":memory:" });
   let counter = 0;
+  let proposalPath = "";
   const comp = createComposition({
     store,
     runner: createFixtureRunner((req) => {
       if (req.turnType.startsWith("planner")) {
-        return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] });
+        const text = authorEnvelope(req, "ship the rate limiter");
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
       }
       if (req.turnType.includes("review")) {
-        return envelope(req, "reviewer", { objections: [], cleanRationale: "all good" });
+        return pairClean(req, proposalPath);
       }
       return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
     }),
@@ -568,22 +726,21 @@ test("notification: guardrail conflict abort re-emits exactly one escalation thr
   const sink = createMemorySink();
   const store = new PersistenceStore({ path: ":memory:" });
   let counter = 0;
+  let proposalPath = "";
   const comp = createComposition({
     store,
     runner: createFixtureRunner((req) => {
       if (req.turnType.startsWith("planner")) {
         const isIter2 = req.iterationId.endsWith("iter-2");
-        const payload = isIter2
-          ? { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [
-              { objectionId: "OBJ-1", resolutionStrategy: "conceded" as const, evidence: "no gate can verify this", requiresGuardrailException: false },
-            ] }
-          : { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] };
-        return envelope(req, "planner", payload);
+        const addressed = isIter2
+          ? [{ objectionId: "OBJ-1", resolutionStrategy: "conceded" as const, evidence: "no gate can verify this", requiresGuardrailException: false }]
+          : [];
+        const text = authorEnvelope(req, "ship the rate limiter", addressed);
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
       }
       if (req.turnType.includes("review")) {
-        return envelope(req, "reviewer", {
-          objections: [{ id: "OBJ-1", severity: "blocking", claim: "no gate", evidence: ["a.ts:1"] }],
-        });
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "blocking", claim: "no gate", evidence: ["a.ts:1"] }]);
       }
       return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
     }),
@@ -625,6 +782,7 @@ test("notification: accepted stalemate resolution produces no escalation notific
   const sink = createMemorySink();
   const store = new PersistenceStore({ path: ":memory:" });
   let counter = 0;
+  let proposalPath = "";
   const comp = createComposition({
     store,
     runner: createFixtureRunner((req) => {
@@ -633,12 +791,12 @@ test("notification: accepted stalemate resolution produces no escalation notific
         const addressed = isIter2
           ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
           : [];
-        return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: addressed });
+        const text = authorEnvelope(req, "ship the rate limiter", addressed);
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
       }
       if (req.turnType.includes("review")) {
-        return envelope(req, "reviewer", {
-          objections: [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }],
-        });
+        return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
       }
       return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
     }),
@@ -672,18 +830,20 @@ test("notification: ordinary iteration cap emits exactly one iteration_cap notif
   const sink = createMemorySink();
   const store = new PersistenceStore({ path: ":memory:" });
   let counter = 0;
+  let proposalPath = "";
   const comp = createComposition({
     store,
     runner: createFixtureRunner((req) => {
       if (req.turnType.startsWith("planner")) {
-        return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] });
+        const text = authorEnvelope(req, "ship the rate limiter");
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
       }
       if (req.turnType.includes("review")) {
-        const onIter1 = req.iterationId.endsWith("iter-1");
-        const objections = onIter1
-          ? [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]
-          : [];
-        return envelope(req, "reviewer", { objections });
+        if (req.iterationId.endsWith("iter-1")) {
+          return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+        }
+        return pairClean(req, proposalPath);
       }
       return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
     }),
@@ -696,7 +856,7 @@ test("notification: ordinary iteration cap emits exactly one iteration_cap notif
 
   const result = await runReviewLoop(comp, {
     ...loopInput,
-    maxIterations: 2,
+    maxIterations: 1,
   });
   assert.equal(result.phase, "escalated");
   assert.ok(result.openObjectionIds.includes("OBJ-1"));
@@ -726,16 +886,24 @@ test("churnDetection is deferred (no-op): A-B-A does not stop before the next re
   const proposalTexts = [proposalA, proposalB, proposalA];
 
   let plannerIteration = 0;
+  let lastProposalPath = "";
   const reviewerIterations: string[] = [];
   const resolver = (req: AgentTurnRequest): string => {
     if (req.turnType.startsWith("planner")) {
       const index = plannerIteration++;
-      const proposalPath = join(runsRoot, `proposal-${index + 1}.md`);
-      writeFileSync(proposalPath, proposalTexts[index]!, "utf8");
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, proposalTexts[index]!, "utf8");
+      lastProposalPath = turnProposalPath;
+      const addressed = index === 1
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "src/a.ts:1 updated plan section", requiresGuardrailException: false }]
+        : index === 2
+          ? [{ objectionId: "OBJ-2", resolutionStrategy: "revised_plan" as const, evidence: "src/a.ts:2 updated plan section", requiresGuardrailException: false }]
+          : [];
       const text = envelope(req, "planner", {
-        proposalPath,
+        proposalPath: turnProposalPath,
         summary: `proposal ${index + 1}`,
-        objectionsAddressed: [],
+        objectionsAddressed: addressed,
       });
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
@@ -743,9 +911,14 @@ test("churnDetection is deferred (no-op): A-B-A does not stop before the next re
     }
     if (req.turnType.includes("review")) {
       reviewerIterations.push(req.iterationId);
-      const text = envelope(req, "reviewer", {
-        objections: [{ id: "OBJ-1", severity: "major", claim: "needs more evidence", evidence: ["plan.md:1"] }],
-      });
+      if (req.iterationId.endsWith("iter-3")) {
+        const text = pairClean(req, lastProposalPath);
+        mkdirSync(dirname(req.resultPath), { recursive: true });
+        writeFileSync(req.resultPath, text, "utf8");
+        return text;
+      }
+      const objId = req.iterationId.endsWith("iter-1") ? "OBJ-1" : "OBJ-2";
+      const text = pairObjections(req, lastProposalPath, [{ id: objId, severity: "major", claim: "needs more evidence", evidence: ["src/a.ts:1"] }]);
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
@@ -793,16 +966,24 @@ test("churnDetection is deferred (no-op): A-A-A does not falsely trigger churn",
   const proposalTexts = [proposalA, proposalA, proposalA];
 
   let plannerIteration = 0;
+  let lastProposalPath = "";
   const reviewerIterations: string[] = [];
   const resolver = (req: AgentTurnRequest): string => {
     if (req.turnType.startsWith("planner")) {
       const index = plannerIteration++;
-      const proposalPath = join(runsRoot, `proposal-${index + 1}.md`);
-      writeFileSync(proposalPath, proposalTexts[index]!, "utf8");
+      const turnProposalPath = join(dirname(req.resultPath), "proposal.md");
+      mkdirSync(dirname(turnProposalPath), { recursive: true });
+      writeFileSync(turnProposalPath, proposalTexts[index]!, "utf8");
+      lastProposalPath = turnProposalPath;
+      const addressed = index === 1
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "src/a.ts:1 updated plan section", requiresGuardrailException: false }]
+        : index === 2
+          ? [{ objectionId: "OBJ-2", resolutionStrategy: "revised_plan" as const, evidence: "src/a.ts:2 updated plan section", requiresGuardrailException: false }]
+          : [];
       const text = envelope(req, "planner", {
-        proposalPath,
+        proposalPath: turnProposalPath,
         summary: `proposal ${index + 1}`,
-        objectionsAddressed: [],
+        objectionsAddressed: addressed,
       });
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
@@ -810,9 +991,14 @@ test("churnDetection is deferred (no-op): A-A-A does not falsely trigger churn",
     }
     if (req.turnType.includes("review")) {
       reviewerIterations.push(req.iterationId);
-      const text = envelope(req, "reviewer", {
-        objections: [{ id: "OBJ-1", severity: "major", claim: "needs more evidence", evidence: ["plan.md:1"] }],
-      });
+      if (req.iterationId.endsWith("iter-3")) {
+        const text = pairClean(req, lastProposalPath);
+        mkdirSync(dirname(req.resultPath), { recursive: true });
+        writeFileSync(req.resultPath, text, "utf8");
+        return text;
+      }
+      const objId = req.iterationId.endsWith("iter-1") ? "OBJ-1" : "OBJ-2";
+      const text = pairObjections(req, lastProposalPath, [{ id: objId, severity: "major", claim: "needs more evidence", evidence: ["src/a.ts:1"] }]);
       mkdirSync(dirname(req.resultPath), { recursive: true });
       writeFileSync(req.resultPath, text, "utf8");
       return text;
@@ -856,14 +1042,17 @@ test("notification: blocking terminal frontier at iteration cap does not throw a
   const sink = createMemorySink();
   const store = new PersistenceStore({ path: ":memory:" });
   let counter = 0;
+  let proposalPath = "";
   const comp = createComposition({
     store,
     runner: createFixtureRunner((req) => {
       if (req.turnType.startsWith("planner")) {
-        return envelope(req, "planner", { proposalPath: "plan.md", summary: "ship the rate limiter", objectionsAddressed: [] });
+        const text = authorEnvelope(req, "ship the rate limiter");
+        proposalPath = join(dirname(req.resultPath), "proposal.md");
+        return text;
       }
       if (req.turnType.includes("review")) {
-        return envelope(req, "reviewer", { objections: [], cleanRationale: "all good" });
+        return pairClean(req, proposalPath);
       }
       return envelope(req, "frontier", { readiness: "not_ready", risks: ["unmitigated deploy risk"], questions: [] });
     }),
@@ -890,4 +1079,140 @@ test("notification: blocking terminal frontier at iteration cap does not throw a
   assert.equal(req.summary, "iteration_cap");
   assert.equal(req.dashboardDeepLink, "https://app.example.test/wf/workflow-1");
   assert.ok((req.openObjectionIds?.length ?? 0) > 0, "notification must include open objection IDs");
+});
+
+test("decision callback mutating proposal.md before approve refuses approval", async () => {
+  let proposalPath = "";
+  const { comp } = setup((req) => {
+    if (req.turnType.startsWith("planner")) {
+      const text = authorEnvelope(req, "ship the login rate limiter");
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      return pairClean(req, proposalPath);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    decide: (ctx) => {
+      writeFileSync(ctx.proposalPath!, "# Plan\n\nmutated during decide\n");
+      return { decision: "approved" };
+    },
+  });
+  assert.notEqual(result.phase, "approved");
+});
+
+test("rejection still works when proposal is stale at human decision", async () => {
+  let proposalPath = "";
+  const { comp } = setup((req) => {
+    if (req.turnType.startsWith("planner")) {
+      const text = authorEnvelope(req, "ship the login rate limiter");
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      return pairClean(req, proposalPath);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    decide: (ctx) => {
+      writeFileSync(ctx.proposalPath!, "# Plan\n\nmutated during decide\n");
+      return { decision: "rejected" };
+    },
+  });
+  assert.equal(result.phase, "rejected");
+});
+
+test("decide context includes only current iteration Pair summaries", async () => {
+  const decideContexts: Array<{ pairReviewSummaries?: Array<{ agentId: string; summary: string }> }> = [];
+  let proposalPath = "";
+  const iter1Summary = "iter-1 pair summary marker";
+  const iter2Summary = "iter-2 pair summary marker";
+  const { comp } = setup((req) => {
+    if (req.turnType.startsWith("planner")) {
+      const isIter2 = req.iterationId.endsWith("iter-2");
+      const addressed = isIter2
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
+        : [];
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      const hash = createHash("sha256").update(readFileSync(proposalPath)).digest("hex");
+      if (req.iterationId.endsWith("iter-1")) {
+        return envelope(req, "reviewer", {
+          reviewedProposalPath: proposalPath,
+          reviewedProposalHash: hash,
+          summary: iter1Summary,
+          objections: [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"], suggestedResolution: "Add tests" }],
+        });
+      }
+      return envelope(req, "reviewer", {
+        reviewedProposalPath: proposalPath,
+        reviewedProposalHash: hash,
+        summary: iter2Summary,
+        objections: [],
+        cleanRationale: "All criteria satisfied.",
+      });
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  await runReviewLoop(comp, {
+    ...loopInput,
+    decide: (ctx) => {
+      decideContexts.push(ctx);
+      return { decision: "approved" };
+    },
+  });
+
+  const lastDecide = decideContexts.at(-1);
+  assert.ok(lastDecide?.pairReviewSummaries);
+  assert.equal(lastDecide?.pairReviewSummaries?.length, 1);
+  assert.match(lastDecide?.pairReviewSummaries?.[0]?.summary ?? "", /iter-2 pair summary marker/);
+  assert.doesNotMatch(lastDecide?.pairReviewSummaries?.[0]?.summary ?? "", /iter-1 pair summary marker/);
+});
+
+test("accept_mitigation refuses when proposal.md mutated during stalemate", async () => {
+  let proposalPath = "";
+  const { comp } = setup((req) => {
+    if (req.turnType.startsWith("planner")) {
+      const isIter2 = req.iterationId.endsWith("iter-2");
+      const addressed = isIter2
+        ? [{ objectionId: "OBJ-1", resolutionStrategy: "revised_plan" as const, evidence: "a.ts:1 fixed", requiresGuardrailException: false }]
+        : [];
+      const text = authorEnvelope(req, "ship the login rate limiter", addressed);
+      proposalPath = join(dirname(req.resultPath), "proposal.md");
+      return text;
+    }
+    if (req.turnType.includes("review")) {
+      return pairObjections(req, proposalPath, [{ id: "OBJ-1", severity: "major", claim: "missing tests", evidence: ["a.ts:1"] }]);
+    }
+    return envelope(req, "frontier", { readiness: "ready", risks: [], questions: [] });
+  });
+
+  const result = await runReviewLoop(comp, {
+    ...loopInput,
+    maxIterations: 5,
+    onStalemate: () => {
+      writeFileSync(proposalPath, "# Plan\n\nmutated during stalemate\n");
+      return "accept_mitigation";
+    },
+  });
+  assert.notEqual(result.phase, "approved");
+});
+
+test("empty reviewerAgentIds throws at loop entry", async () => {
+  const { comp } = setup(() => "");
+  await assert.rejects(
+    () => runReviewLoop(comp, { ...loopInput, reviewerAgentIds: [] }),
+    /requires at least one Pair agent/,
+  );
 });

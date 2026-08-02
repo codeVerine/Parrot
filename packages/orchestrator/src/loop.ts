@@ -5,28 +5,56 @@ import { stalemateObjectionIds, type FoldedState, type WorkflowEngineConfig, typ
 import type { Composition } from "./composition.js";
 import { buildStalemateReport } from "./escalation-report.js";
 import {
+  humanMessagesContextArgs,
+  humanMessagesFromFeedback,
+  normalizeStalemateResolution,
+  persistHumanGuidance,
+  stalemateFeedbackDecision,
+  type HumanMessage,
+  type StalemateChoice,
+  type StalemateResolution,
+} from "./human-guidance.js";
+import {
   isMajorRestructuring,
   loadProposalAtIteration,
 } from "./proposal-diff.js";
+import { assertProposalFresh, readProposalHash } from "./proposal-integrity.js";
 import type { ResumeSeed } from "./resume.js";
 import { readFileSync } from "node:fs";
+import { hashProposalFile } from "./turn.js";
+
+export type { StalemateChoice, StalemateResolution, HumanMessage } from "./human-guidance.js";
 
 export type HumanDecision = { decision: "approved" | "rejected"; waiveOpenObjections?: boolean; comment?: string };
+
+export type PairReviewSummary = {
+  agentId: string;
+  summary: string;
+};
 
 export type HumanDecisionResolver = (ctx: {
   workflowId: string;
   openObjectionIds: string[];
+  /** Open objections with claim/severity for human-facing prompts. */
+  openObjections: ObjectionView[];
   frontierReadiness: "ready" | "not_ready" | null;
+  proposalPath?: string;
+  proposalHash?: string;
+  proposalSummary?: string;
+  /** Pair summaries for the current Author proposal iteration only. */
+  pairReviewSummaries?: PairReviewSummary[];
 }) => HumanDecision | Promise<HumanDecision>;
-
-export type StalemateChoice = "accept_mitigation" | "accept_objection" | "abort";
 
 export type StalemateResolver = (ctx: {
   workflowId: string;
   objectionIds: string[];
   report: string;
   reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn";
-}) => StalemateChoice | Promise<StalemateChoice>;
+  proposalPath?: string;
+  proposalHash?: string;
+  proposalSummary?: string;
+  openObjections?: ObjectionView[];
+}) => StalemateChoice | StalemateResolution | Promise<StalemateChoice | StalemateResolution>;
 
 export type ReviewLoopInput = {
   workflowId: string;
@@ -82,9 +110,12 @@ export type ReviewLoopResult = {
   openObjectionIds: string[];
   frontierReadiness: "ready" | "not_ready" | null;
   finalProposalPath?: string;
+  finalProposalHash?: string;
   failedTurnId?: string;
   frontierFailed?: boolean;
   escalation?: { reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn"; objectionIds: string[] };
+  /** Binding human guidance collected during this run (and rehydrated on resume). */
+  humanMessages: HumanMessage[];
 };
 
 /**
@@ -100,12 +131,24 @@ export async function runReviewLoop(
 ): Promise<ReviewLoopResult> {
   const { engine } = comp;
   const { workflowId } = input;
-  const maxIterations = input.maxIterations ?? input.resume?.maxIterations ?? 5;
+
+  if (input.reviewerAgentIds.length === 0) {
+    throw new Error(
+      "runReviewLoop requires at least one Pair agent in reviewerAgentIds (fail-closed).",
+    );
+  }
+
+  const maxIterationsCap = input.maxIterations ?? input.resume?.maxIterations ?? 5;
+  let maxIterations = maxIterationsCap;
 
   const views = input.resume ? input.resume.views : new Map<string, ObjectionView>();
   let frontierReadiness: "ready" | "not_ready" | null = input.resume ? input.resume.frontierReadiness : null;
   let finalProposalPath: string | undefined = input.resume?.finalProposalPath;
+  let finalProposalHash: string | undefined = input.resume?.finalProposalHash;
   let proposalSummary: string | undefined = input.resume?.proposalSummary;
+  let pairReviewSummaries: PairReviewSummary[] = input.resume?.pairReviewSummaries
+    ? [...input.resume.pairReviewSummaries]
+    : [];
   let lastFrontierIteration = input.resume?.lastFrontierIteration ?? 0;
   const codebaseContext = input.codebaseContext ?? [];
   const codebaseContextArgs = codebaseContext.length > 0 ? { codebaseContext } : {};
@@ -118,6 +161,10 @@ export async function runReviewLoop(
   // should fire (set threshold at 0.7 so 0.765 clears it).
   const frontierHeadingChangeRatio = input.frontierReinvoke?.headingChangeRatio ?? 0.7;
   const frontierSimilarityFloor = input.frontierReinvoke?.similarityFloor ?? 0.4;
+  const humanMessages: HumanMessage[] = input.resume?.humanMessages
+    ? [...input.resume.humanMessages]
+    : humanMessagesFromFeedback(comp.store, workflowId);
+  const guidanceArgs = () => humanMessagesContextArgs(humanMessages);
 
   if (!input.resume) {
     comp.startWorkflow({
@@ -143,16 +190,46 @@ export async function runReviewLoop(
     iterations: iteration,
     openObjectionIds: openIds(),
     frontierReadiness,
+    humanMessages: [...humanMessages],
     ...(finalProposalPath ? { finalProposalPath } : {}),
+    ...(finalProposalHash ? { finalProposalHash } : {}),
     ...extra,
   });
 
+  const ensureProposalFresh = (): string | null => {
+    if (!finalProposalPath || !finalProposalHash) {
+      return "Cannot approve or implement without a hashed Author proposal of record";
+    }
+    const check = assertProposalFresh({
+      proposalPath: finalProposalPath,
+      expectedHash: finalProposalHash,
+    });
+    return check.ok ? null : check.reason;
+  };
+
+  const commitApproval = (opts?: {
+    waiveOpenObjections?: boolean;
+    comment?: string;
+  }): boolean => {
+    const stale = ensureProposalFresh();
+    if (stale) {
+      input.onProgress?.(`[human] refused stale proposal: ${compactProgress(stale)}`);
+      return false;
+    }
+    engine.humanDecision({
+      workflowId,
+      decision: "approved",
+      ...(opts?.waiveOpenObjections ? { waiveOpenObjections: true } : {}),
+      ...(opts?.comment ? { comment: opts.comment } : {}),
+    });
+    return true;
+  };
+
   /**
    * Common resolution for an escalation that should not dead-end the run: ask
-   * `onStalemate` (reused for both an objection stalemate and a planner-reported
-   * guardrail conflict - both put the same choice to the human) and act on it.
-   * "continue" means the loop should re-read phase and keep going (the resolver's
-   * decision already advanced the engine to approved/rejected).
+   * `onStalemate` (reused for objection stalemate, guardrail conflict, and plan
+   * churn) and act on it.
+   * "continue" means the loop should re-read phase and keep going.
    */
   const resolveEscalation = async (
     reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn",
@@ -160,16 +237,43 @@ export async function runReviewLoop(
     reportOverride?: string,
   ): Promise<"continue" | ReviewLoopResult> => {
     const report = reportOverride ?? buildStalemateReport(comp.store, workflowId, objectionIds, reason === "plan_churn" ? "objection_stalemate" : reason);
-    const choice = input.onStalemate
-      ? await input.onStalemate({ workflowId, objectionIds, report, reason })
+    const rawChoice = input.onStalemate
+      ? await input.onStalemate({
+          workflowId,
+          objectionIds,
+          report,
+          reason,
+          ...(finalProposalPath ? { proposalPath: finalProposalPath } : {}),
+          ...(finalProposalHash ? { proposalHash: finalProposalHash } : {}),
+          ...(proposalSummary ? { proposalSummary } : {}),
+          openObjections: openViews(),
+        })
       : "abort";
+    const { choice, guidance } = normalizeStalemateResolution(rawChoice);
+    if (guidance) {
+      persistHumanGuidance({
+        store: comp.store,
+        workflowId,
+        decision: stalemateFeedbackDecision(choice),
+        guidance,
+        iterationId: `${workflowId}-iter-${iteration}`,
+        messages: humanMessages,
+        afterIteration: iteration,
+      });
+    }
 
     if (choice === "accept_mitigation") {
-      engine.humanDecision({ workflowId, decision: "approved", waiveOpenObjections: true });
+      if (!commitApproval({ waiveOpenObjections: true })) {
+        return finalize();
+      }
       return "continue";
     }
     if (choice === "accept_objection") {
-      engine.humanDecision({ workflowId, decision: "rejected" });
+      // Reviewer side wins: keep objections open, bump stalemate threshold and
+      // maxIterations, return to planner_turn for another revision round.
+      engine.continueAfterStalemate({ workflowId, objectionIds });
+      maxIterations += 1;
+      iteration += 1;
       return "continue";
     }
     // Abort: the human is not in the loop, so the durable record stands but
@@ -234,18 +338,37 @@ export async function runReviewLoop(
           workflowId,
           iterationId,
           agentId: input.plannerAgentId,
-          context: { task: input.task, openObjections: openViews(), ...codebaseContextArgs },
+          context: {
+            task: input.task,
+            openObjections: openViews(),
+            // Revise must re-open the prior plan of record; without this path the
+            // planner only sees objections and may invent a shallow new proposal.
+            ...(iteration > 1 && finalProposalPath
+              ? {
+                  proposalPath: finalProposalPath,
+                  ...(proposalSummary ? { proposalSummary } : {}),
+                }
+              : {}),
+            ...codebaseContextArgs,
+            ...guidanceArgs(),
+          },
           iterationNumber: iteration,
           inputObjectionIds,
         });
         if (planner.status !== "valid") {
-          input.onProgress?.(`[planner iter ${iteration}] failed: ${compactProgress(planner.reason)}`);
+          input.onProgress?.(`[author iter ${iteration}] failed: ${compactProgress(planner.reason)}`);
           return finalize({ failedTurnId: planner.turnId });
         }
         const plannerPayload = planner.payload as PlannerResult;
-        input.onProgress?.(`[planner iter ${iteration}] ${compactProgress(plannerPayload.summary)}`);
+        input.onProgress?.(`[author iter ${iteration}] ${compactProgress(plannerPayload.summary)}`);
         finalProposalPath = plannerPayload.proposalPath;
         proposalSummary = plannerPayload.summary;
+        try {
+          finalProposalHash = hashProposalFile(plannerPayload.proposalPath);
+        } catch {
+          input.onProgress?.(`[author iter ${iteration}] failed: proposal file unreadable for hashing`);
+          return finalize({ failedTurnId: planner.turnId });
+        }
 
         const addressals = plannerPayload.objectionsAddressed;
         const liveState = engine.getState(workflowId);
@@ -332,8 +455,17 @@ export async function runReviewLoop(
               turnId: planner.turnId,
             });
             // Update only the status in the persisted objection row (preserve provenance).
-            comp.store.updateObjectionStatus(objectionId, "resolved");
-            views.delete(objectionId);
+            comp.store.updateObjectionStatus(workflowId, objectionId, "resolved");
+            // Retain the view as resolved with addressal evidence for the next Pair prompt.
+            const prior = views.get(objectionId)!;
+            views.set(objectionId, {
+              ...prior,
+              status: "resolved",
+              addressal: {
+                resolutionStrategy: addressal.resolutionStrategy,
+                evidence,
+              },
+            });
           }
         }
 
@@ -350,6 +482,18 @@ export async function runReviewLoop(
 
       case "collect_objections": {
         const proposalPath = requireProposal(phase);
+        if (!finalProposalHash) {
+          const hashed = readProposalHash(proposalPath);
+          if (!hashed) {
+            return finalize({
+              failedTurnId: undefined,
+              // Surface as a failed planning step without a clean gate.
+            });
+          }
+          finalProposalHash = hashed;
+        }
+        // Current-iteration Pair summaries only (matches resume recovery).
+        pairReviewSummaries = [];
         for (const [i, agentId] of input.reviewerAgentIds.entries()) {
           const isAdversarial = input.adversarial === true && i === input.reviewerAgentIds.length - 1;
           const reviewer = await comp.runTurn({
@@ -359,19 +503,32 @@ export async function runReviewLoop(
             agentId,
             context: {
               proposalPath,
+              proposalHash: finalProposalHash,
               ...(proposalSummary ? { proposalSummary } : {}),
               openObjections: openViews(),
               allObjections: [...views.values()],
               ...codebaseContextArgs,
+              ...guidanceArgs(),
             },
+            expectedProposalPath: proposalPath,
+            expectedProposalHash: finalProposalHash,
           });
           if (reviewer.status !== "valid") {
-            input.onProgress?.(`[${isAdversarial ? "adversarial" : "reviewer"} iter ${iteration}] failed: ${compactProgress(reviewer.reason)}`);
-            continue;
+            input.onProgress?.(
+              `[${isAdversarial ? "pair-adversarial" : "pair"} iter ${iteration}] failed: ${compactProgress(reviewer.reason)}`,
+            );
+            // Fail-closed: a missing/malformed/stale Pair review must not open a clean gate.
+            return finalize({ failedTurnId: reviewer.turnId });
           }
           const reviewerPayload = reviewer.payload as ReviewerResult;
+          if (reviewerPayload.summary?.trim()) {
+            pairReviewSummaries.push({
+              agentId,
+              summary: reviewerPayload.summary.trim(),
+            });
+          }
           input.onProgress?.(
-            `[${isAdversarial ? "adversarial" : "reviewer"} iter ${iteration}] objections=${reviewerPayload.objections.length}` +
+            `[${isAdversarial ? "pair-adversarial" : "pair"} iter ${iteration}] objections=${reviewerPayload.objections.length}` +
               (reviewerPayload.objections.length === 0 && reviewerPayload.cleanRationale?.trim()
                 ? ", cleanRationale=present"
                 : ""),
@@ -381,6 +538,7 @@ export async function runReviewLoop(
             const existingView = views.get(objection.id);
             if (existingView && existingView.turnId === reviewer.turnId) continue;
 
+            const suggested = objection.suggestedResolution?.trim();
             raiseObjection(comp, workflowId, iterationId, reviewer.turnId, agentId, {
               id: objection.id,
               severity: objection.severity,
@@ -388,6 +546,7 @@ export async function runReviewLoop(
               claim: objection.claim,
               evidence: objection.evidence,
               evidenceMissing: objection.evidence_missing === true,
+              ...(suggested ? { suggestedResolution: suggested } : {}),
             });
             views.set(objection.id, {
               id: objection.id,
@@ -399,6 +558,7 @@ export async function runReviewLoop(
               raisedBy: agentId,
               turnId: reviewer.turnId,
               ...(objection.evidence_missing === true ? { evidence_missing: true } : {}),
+              ...(suggested ? { suggestedResolution: suggested } : {}),
             });
           }
         }
@@ -434,6 +594,7 @@ export async function runReviewLoop(
                     ...(proposalSummary ? { proposalSummary } : {}),
                     allObjections: [...views.values()],
                     ...codebaseContextArgs,
+                    ...guidanceArgs(),
                   },
                   iterationNumber: iteration,
                 });
@@ -494,6 +655,7 @@ export async function runReviewLoop(
             ...(proposalSummary ? { proposalSummary } : {}),
             allObjections: [...views.values()],
             ...codebaseContextArgs,
+            ...guidanceArgs(),
           },
         });
         if (frontier.status !== "valid") {
@@ -540,20 +702,62 @@ export async function runReviewLoop(
         break;
 
       case "human_decision": {
-        const decision = await input.decide({ workflowId, openObjectionIds: openIds(), frontierReadiness });
-        engine.humanDecision({
+        const decision = await input.decide({
           workflowId,
-          decision: decision.decision,
-          ...(decision.waiveOpenObjections ? { waiveOpenObjections: true } : {}),
-          ...(decision.comment ? { comment: decision.comment } : {}),
+          openObjectionIds: openIds(),
+          openObjections: openViews(),
+          frontierReadiness,
+          ...(finalProposalPath ? { proposalPath: finalProposalPath } : {}),
+          ...(finalProposalHash ? { proposalHash: finalProposalHash } : {}),
+          ...(proposalSummary ? { proposalSummary } : {}),
+          ...(pairReviewSummaries.length > 0 ? { pairReviewSummaries } : {}),
         });
+        if (decision.comment?.trim()) {
+          persistHumanGuidance({
+            store: comp.store,
+            workflowId,
+            decision: decision.decision,
+            guidance: decision.comment,
+            iterationId: `${workflowId}-iter-${iteration}`,
+            messages: humanMessages,
+            afterIteration: iteration,
+          });
+        }
+        if (decision.decision === "approved") {
+          if (
+            !commitApproval({
+              ...(decision.waiveOpenObjections ? { waiveOpenObjections: true } : {}),
+              ...(decision.comment ? { comment: decision.comment } : {}),
+            })
+          ) {
+            return finalize();
+          }
+        } else {
+          engine.humanDecision({
+            workflowId,
+            decision: decision.decision,
+            ...(decision.waiveOpenObjections ? { waiveOpenObjections: true } : {}),
+            ...(decision.comment ? { comment: decision.comment } : {}),
+          });
+        }
         break;
       }
 
       case "approved":
       case "rejected":
-      case "escalated":
         return finalize();
+
+      case "escalated": {
+        // Resume after Ctrl+C at a stalemate prompt leaves phase=escalated. Re-offer the
+        // human choice instead of treating that as a terminal exit.
+        const state = engine.getState(workflowId);
+        if (state.iterationCapReached) return finalize();
+        const stalemateIds = stalemateObjectionIds(state);
+        if (stalemateIds.length === 0) return finalize();
+        const outcome = await resolveEscalation("objection_stalemate", stalemateIds);
+        if (outcome !== "continue") return outcome;
+        break;
+      }
 
       default: {
         const _exhaustive: never = phase;
@@ -577,6 +781,7 @@ function raiseObjection(
     claim: string;
     evidence: string[];
     evidenceMissing: boolean;
+    suggestedResolution?: string;
   },
 ): void {
   comp.engine.raiseObjection({
@@ -597,6 +802,9 @@ function raiseObjection(
     claim: objection.claim,
     evidence: objection.evidence,
     evidenceMissing: objection.evidenceMissing,
+    ...(objection.suggestedResolution
+      ? { suggestedResolution: objection.suggestedResolution }
+      : {}),
     status: "open",
     raisedBy: agentId,
   });

@@ -63,7 +63,7 @@ Each role schema is validated independently. A malformed result gets one bounded
 
 ## 12. Test plan and open questions
 
-Contract tests cover TOON round trips, envelope predicates, the seventeen-event
+Contract tests cover TOON round trips, envelope predicates, the eighteen-event
 catalog, eleven-signal taxonomy, objection transitions, and additive
 versioning. Phase 1 records the schema-evolution question: how aggressively
 schemas may evolve before persistent planner continuity requires a major

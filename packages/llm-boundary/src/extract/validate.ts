@@ -1,5 +1,6 @@
 import {
   ResultEnvelopeSchema,
+  isProposalContentHash,
   parseToon,
   rejectEnvelopeMismatch,
   rejectMissingNonce,
@@ -10,6 +11,11 @@ import {
   type ResultEnvelope,
 } from "@platform/contracts";
 import { sha256Hex } from "../hash.js";
+import {
+  isAuthorCompleteAddressalPrompt,
+  isAuthorProposalPathPrompt,
+  isRichPairPrompt,
+} from "../prompt-version.js";
 import type { ExtractionVerdict, LlmBoundaryConfig, TurnType, ValidateResultInput } from "../types.js";
 import { envelopeRoleForTurnType, schemaForTurnType } from "./schemas.js";
 import { truncateDiagnostics } from "./verdict.js";
@@ -100,7 +106,13 @@ export class ResultExtractor {
       return fail("schema_invalid", validated.error.message);
     }
 
-    const evidenceIssue = checkEvidenceRules(validated.data, rolePayload, input.inputObjectionIds ?? []);
+    const evidenceIssue = checkEvidenceRules(validated.data, rolePayload, {
+      inputObjectionIds: input.inputObjectionIds ?? [],
+      promptVersion: input.promptVersion,
+      expectedProposalPath: input.expectedProposalPath,
+      expectedProposalHash: input.expectedProposalHash,
+      expectedProposalOutputPath: input.expectedProposalOutputPath,
+    });
     if (evidenceIssue) return fail("evidence_rules", evidenceIssue);
 
     const isMerge =
@@ -132,18 +144,35 @@ function normalizePayload(payload: Record<string, unknown>, role: string): Recor
   return payload;
 }
 
+type EvidenceRuleContext = {
+  inputObjectionIds: readonly string[];
+  promptVersion?: string;
+  expectedProposalPath?: string;
+  expectedProposalHash?: string;
+  expectedProposalOutputPath?: string;
+};
+
 function checkEvidenceRules(
   payload: unknown,
   rawPayload: Record<string, unknown>,
-  inputObjectionIds: readonly string[],
+  ctx: EvidenceRuleContext,
 ): string | null {
   if (typeof payload !== "object" || payload === null) return null;
   const role = (payload as { role?: string }).role;
+  const promptVersion = ctx.promptVersion ?? "";
 
   if (role === "reviewer") {
     const reviewerPayload = payload as {
-      objections?: Array<{ id: string; evidence: string[]; evidence_missing?: boolean }>;
+      objections?: Array<{
+        id: string;
+        evidence: string[];
+        evidence_missing?: boolean;
+        suggestedResolution?: string;
+      }>;
       cleanRationale?: string;
+      reviewedProposalPath?: string;
+      reviewedProposalHash?: string;
+      summary?: string;
     };
     const objections = reviewerPayload.objections;
     if (!objections) return null;
@@ -155,27 +184,91 @@ function checkEvidenceRules(
     if (objections.length === 0 && !reviewerPayload.cleanRationale?.trim()) {
       return "Reviewer returned zero objections without a cleanRationale";
     }
+
+    if (isRichPairPrompt(promptVersion)) {
+      const path = reviewerPayload.reviewedProposalPath?.trim() ?? "";
+      if (!path) return "Pair result missing reviewedProposalPath";
+      const hash = reviewerPayload.reviewedProposalHash?.trim() ?? "";
+      if (!isProposalContentHash(hash)) {
+        return "Pair result reviewedProposalHash must be 64 lowercase hex characters";
+      }
+      if (!reviewerPayload.summary?.trim()) {
+        return "Pair result missing summary";
+      }
+      for (const objection of objections) {
+        if (!objection.suggestedResolution?.trim()) {
+          return `Objection ${objection.id} missing suggestedResolution`;
+        }
+      }
+      if (ctx.expectedProposalPath && path !== ctx.expectedProposalPath) {
+        return `Pair reviewedProposalPath mismatch: expected ${ctx.expectedProposalPath}, got ${path}`;
+      }
+      if (ctx.expectedProposalHash && hash !== ctx.expectedProposalHash) {
+        return `Pair reviewedProposalHash mismatch: expected ${ctx.expectedProposalHash}, got ${hash}`;
+      }
+    }
     return null;
   }
 
   if (role === "planner") {
-    const addressed = (
-      payload as {
-        objectionsAddressed?: Array<{ objectionId: string; resolutionStrategy: string; evidence: string }>;
+    const plannerPayload = payload as {
+      proposalPath?: string;
+      objectionsAddressed?: Array<{
+        objectionId: string;
+        resolutionStrategy: string;
+        evidence: string;
+      }>;
+    };
+
+    if (isAuthorProposalPathPrompt(promptVersion) && ctx.expectedProposalOutputPath) {
+      const path = plannerPayload.proposalPath?.trim() ?? "";
+      if (path !== ctx.expectedProposalOutputPath) {
+        return `Author proposalPath must equal ${ctx.expectedProposalOutputPath}, got ${path || "(empty)"}`;
       }
-    ).objectionsAddressed;
-    if (!addressed || addressed.length === 0) return null;
-    // Index into the pre-transform payload to tell a fresh structured addressal apart
-    // from a bare-ID legacy entry (same post-parse shape, but not evidence-checked - it
-    // predates this rule and must still validate on resume).
+    }
+
+    const addressed = plannerPayload.objectionsAddressed;
+    if (!addressed || addressed.length === 0) {
+      if (
+        isAuthorCompleteAddressalPrompt(promptVersion) &&
+        ctx.inputObjectionIds.length > 0
+      ) {
+        return `Author must address every open objection exactly once; missing addressals for: ${ctx.inputObjectionIds.join(", ")}`;
+      }
+      return null;
+    }
+
     const rawAddressed = Array.isArray(rawPayload.objectionsAddressed) ? rawPayload.objectionsAddressed : [];
     for (const [index, addressal] of addressed.entries()) {
       if (typeof rawAddressed[index] === "string") continue;
       if (addressal.resolutionStrategy === "revised_plan" && addressal.evidence.trim().length === 0) {
         return `Objection addressal ${addressal.objectionId} has resolutionStrategy revised_plan with empty evidence`;
       }
-      if (!inputObjectionIds.includes(addressal.objectionId)) {
+      if (!ctx.inputObjectionIds.includes(addressal.objectionId)) {
         return `Objection addressal references ${addressal.objectionId}, which is not among the turn's input objection IDs`;
+      }
+    }
+
+    if (isAuthorCompleteAddressalPrompt(promptVersion) && ctx.inputObjectionIds.length > 0) {
+      const seen = new Set<string>();
+      for (const [index, addressal] of addressed.entries()) {
+        if (typeof rawAddressed[index] === "string") {
+          return `Author@1.8.0+ rejects legacy bare-ID addressal for ${addressal.objectionId}`;
+        }
+        if (seen.has(addressal.objectionId)) {
+          return `Author addressed ${addressal.objectionId} more than once`;
+        }
+        seen.add(addressal.objectionId);
+        if (!addressal.evidence.trim()) {
+          return `Objection addressal ${addressal.objectionId} has empty evidence`;
+        }
+      }
+      const missing = ctx.inputObjectionIds.filter((id) => !seen.has(id));
+      if (missing.length > 0) {
+        return `Author must address every open objection exactly once; missing addressals for: ${missing.join(", ")}`;
+      }
+      if (seen.size !== ctx.inputObjectionIds.length) {
+        return "Author addressals must match the open objection set exactly";
       }
     }
     return null;

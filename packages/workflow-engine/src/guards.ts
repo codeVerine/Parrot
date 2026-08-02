@@ -11,10 +11,11 @@ export function hasOpenObjections(state: FoldedState): boolean {
   return openObjectionIds(state).length > 0;
 }
 
-/** Open objections that were resolved once and re-raised: the stalemate signal. */
+/** Open objections that meet or exceed the workflow's stalemate re-raise threshold. */
 export function stalemateObjectionIds(state: FoldedState): string[] {
+  const threshold = state.stalemateReraiseThreshold ?? 1;
   return Object.values(state.objections)
-    .filter((objection) => objection.status === "open" && objection.reraiseCount >= 1)
+    .filter((objection) => objection.status === "open" && objection.reraiseCount >= threshold)
     .map((objection) => objection.objectionId)
     .sort();
 }
@@ -65,4 +66,5 @@ export const GUARD_INPUT_EVENTS = {
   frontierBlocking: ["ObjectionRaised", "TurnCompleted"],
   humanDecision: ["HumanApproved", "HumanRejected", "ConsensusReached"],
   degradedMode: ["ImplementationBlocked"],
+  stalemateReraiseThreshold: ["StalemateContinued", "ObjectionStalemate"],
 } as const;

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentInfo,
   AgentStartSpec,
+  CreatedTab,
   HerdrAgent,
   HerdrEvent,
   HerdrSnapshot,
@@ -10,6 +11,7 @@ import type {
   PaneReadResult,
 } from "./types.js";
 import type { HerdrCli } from "./cli.js";
+import { EnterNotAcknowledgedError } from "../errors.js";
 
 export interface SocketTransport {
   /**
@@ -31,14 +33,18 @@ export interface SocketTransport {
 }
 
 export type HerdrClient = {
-  /** Create a tab in the workspace so spawned agents share it instead of splitting the current pane. Returns the new tab id. */
-  createTab(workspaceId: string | null, label: string | null, timeoutMs: number): Promise<string>;
+  /**
+   * Create a tab in the workspace so spawned agents share it instead of splitting the
+   * caller's terminal. Returns the tab id and the empty root shell pane id.
+   */
+  createTab(workspaceId: string | null, label: string | null, timeoutMs: number): Promise<CreatedTab>;
   startAgent(spec: AgentStartSpec, timeoutMs: number): Promise<HerdrAgent>;
   sendAgent(target: string, text: string, verificationMarker: string, timeoutMs: number, cli?: HerdrCli): Promise<void>;
   /** Read the visible text content of a pane. */
   readPane(paneId: string, timeoutMs: number): Promise<PaneReadResult>;
   waitAgent(paneId: string, timeoutMs: number): Promise<HerdrAgent | null>;
   interruptAgent(paneId: string, timeoutMs: number): Promise<void>;
+  /** Close a pane (`pane.close`). Used to reclaim the empty root shell after the first agent split. */
   stopAgent(paneId: string, timeoutMs: number): Promise<void>;
   sessionSnapshot(timeoutMs: number): Promise<HerdrSnapshot>;
   listAgents(timeoutMs: number): Promise<HerdrAgent[]>;
@@ -73,6 +79,21 @@ type WaitMatchedResult = { type: "wait_matched"; event?: { event: string; data: 
 type PaneReadResponse = { type: "pane_read"; read: PaneReadResult };
 
 /**
+ * Herdr 0.7.3 `agent.start` always splits (defaults to `right`) when given a tab,
+ * leaving the tab's root shell empty. Close that empty root so the first agent fills
+ * the tab; later agents then split from the occupied agent pane as intended.
+ */
+export async function reclaimEmptyRootPane(
+  client: Pick<HerdrClient, "stopAgent">,
+  rootPaneId: string,
+  agentPaneId: string,
+  timeoutMs: number,
+): Promise<void> {
+  if (rootPaneId === agentPaneId) return;
+  await client.stopAgent(rootPaneId, timeoutMs);
+}
+
+/**
  * Herdr protocol 16 socket client. Every method maps to a real request from
  * `herdr api schema --json`; there is no `agent.wait`/`agent.interrupt`/`agent.stop`,
  * so completion is observed via `events.wait`, interruption via `pane.send_keys`, and
@@ -83,13 +104,17 @@ export class Protocol16SocketClient implements HerdrClient {
   private readonly streamClosers = new Set<() => void>();
   constructor(private readonly transport: SocketTransport, private readonly cli?: HerdrCli) {}
 
-  async createTab(workspaceId: string | null, label: string | null, timeoutMs: number): Promise<string> {
+  async createTab(workspaceId: string | null, label: string | null, timeoutMs: number): Promise<CreatedTab> {
     const result = (await this.transport.request(
       "tab.create",
       { workspace_id: workspaceId, label, focus: false },
       timeoutMs,
     )) as TabCreatedResult;
-    return result.tab.tab_id;
+    const rootPaneId = result.root_pane?.pane_id;
+    if (!rootPaneId) {
+      throw new Error("tab.create did not return root_pane.pane_id");
+    }
+    return { tabId: result.tab.tab_id, rootPaneId };
   }
 
   async startAgent(spec: AgentStartSpec, timeoutMs: number): Promise<HerdrAgent> {
@@ -101,6 +126,7 @@ export class Protocol16SocketClient implements HerdrClient {
         cwd: spec.cwd ?? null,
         workspace_id: spec.workspace_id ?? null,
         tab_id: spec.tab_id ?? null,
+        ...(spec.split !== undefined ? { split: spec.split } : {}),
         env: spec.env ?? {},
         focus: spec.focus ?? false,
       },
@@ -140,33 +166,42 @@ export class Protocol16SocketClient implements HerdrClient {
       }
     }
 
-    const PANE_READ_POLL_MS = 25;
-    const ENTER_CONFIRMATION_MS = 750;
+    const ENTER_RETRY_INTERVAL_MS = 750;
+    const STATUS_POLL_FLOOR_MS = 50;
     const MAX_ENTER_ATTEMPTS = 3;
+    const ACKNOWLEDGED_STATUSES = ["working", "blocked", "done"];
+    const isAcknowledged = (agent: HerdrAgent | null | undefined): boolean =>
+      Boolean(agent && ACKNOWLEDGED_STATUSES.includes(agent.agent_status as string));
 
-    for (let attempt = 0; attempt < MAX_ENTER_ATTEMPTS; attempt++) {
-      await this.transport.request("pane.send_keys", { pane_id: target, keys: ["Enter"] }, remaining());
-
-      const pollDeadline = Date.now() + ENTER_CONFIRMATION_MS;
-      for (;;) {
-        const timeout = Math.max(1, pollDeadline - Date.now());
-        const raw = await this.waitAgent(target, timeout);
-        if (raw && ["working", "blocked", "done"].includes(raw.agent_status as string)) {
-          return;
-        }
-        if (Date.now() >= pollDeadline || remaining() <= 0) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, PANE_READ_POLL_MS));
+    // Press Enter a bounded number of times, but keep confirming for the whole
+    // timeout budget: providers such as claude can take several seconds after
+    // submission before Herdr's agent detection reports them as working.
+    let enterAttempts = 0;
+    let nextEnterAt = 0;
+    while (remaining() > 0) {
+      if (enterAttempts < MAX_ENTER_ATTEMPTS && Date.now() >= nextEnterAt) {
+        await this.transport.request("pane.send_keys", { pane_id: target, keys: ["Enter"] }, remaining());
+        enterAttempts += 1;
+        nextEnterAt = Date.now() + ENTER_RETRY_INTERVAL_MS;
       }
 
-      if (remaining() <= 0) {
-        break;
+      const iterationStart = Date.now();
+      // events.wait only observes future transitions, so also poll the live
+      // status: the flip to "working" may predate the wait or fall between waits.
+      const event = await this.waitAgent(target, Math.max(1, Math.min(ENTER_RETRY_INTERVAL_MS, remaining())));
+      if (isAcknowledged(event)) return;
+      if (remaining() <= 0) break;
+      const current = (await this.listAgents(remaining())).find((candidate) => candidate.pane_id === target);
+      if (isAcknowledged(current)) return;
+
+      const elapsed = Date.now() - iterationStart;
+      if (elapsed < STATUS_POLL_FLOOR_MS && remaining() > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(STATUS_POLL_FLOOR_MS - elapsed, remaining())));
       }
     }
 
-    throw new Error(
-      `Enter not acknowledged: pane ${target} unchanged after ${MAX_ENTER_ATTEMPTS} Enter attempts within ${timeoutMs}ms.`,
+    throw new EnterNotAcknowledgedError(
+      `Enter not acknowledged: pane ${target} never reported an active agent status after ${enterAttempts} Enter attempts within ${timeoutMs}ms.`,
     );
   }
 

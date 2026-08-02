@@ -98,19 +98,44 @@ export class PersistenceTransaction {
   saveObjection(input: ObjectionInput): void {
     const now = new Date().toISOString();
     this.db.prepare(`
-      INSERT INTO objections (objection_id, workflow_id, iteration_id, turn_id, dimension, severity, claim, evidence_toon, evidence_missing, status, raised_by, cluster_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(objection_id) DO UPDATE SET severity = excluded.severity, claim = excluded.claim,
-        evidence_toon = excluded.evidence_toon, evidence_missing = excluded.evidence_missing, status = excluded.status,
-        raised_by = excluded.raised_by, cluster_id = excluded.cluster_id, updated_at = excluded.updated_at
-    `).run(input.objectionId, input.workflowId, input.iterationId, input.turnId, input.dimension, input.severity, input.claim, encodeToon({ evidence: input.evidence }), input.evidenceMissing ? 1 : 0, input.status, input.raisedBy, input.clusterId ?? null, now);
+      INSERT INTO objections (objection_id, workflow_id, iteration_id, turn_id, dimension, severity, claim, evidence_toon, evidence_missing, status, raised_by, cluster_id, suggested_resolution, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workflow_id, objection_id) DO UPDATE SET
+        iteration_id = excluded.iteration_id,
+        turn_id = excluded.turn_id,
+        dimension = excluded.dimension,
+        severity = excluded.severity,
+        claim = excluded.claim,
+        evidence_toon = excluded.evidence_toon,
+        evidence_missing = excluded.evidence_missing,
+        status = excluded.status,
+        raised_by = excluded.raised_by,
+        cluster_id = excluded.cluster_id,
+        suggested_resolution = excluded.suggested_resolution,
+        updated_at = excluded.updated_at
+    `).run(
+      input.objectionId,
+      input.workflowId,
+      input.iterationId,
+      input.turnId,
+      input.dimension,
+      input.severity,
+      input.claim,
+      encodeToon({ evidence: input.evidence }),
+      input.evidenceMissing ? 1 : 0,
+      input.status,
+      input.raisedBy,
+      input.clusterId ?? null,
+      input.suggestedResolution?.trim() ? input.suggestedResolution.trim() : null,
+      now,
+    );
   }
 
   /** Update only the status of an objection row, preserving all other fields. */
-  updateObjectionStatus(objectionId: string, status: string): void {
+  updateObjectionStatus(workflowId: string, objectionId: string, status: string): void {
     this.db.prepare(`
-      UPDATE objections SET status = ?, updated_at = ? WHERE objection_id = ?
-    `).run(status, new Date().toISOString(), objectionId);
+      UPDATE objections SET status = ?, updated_at = ? WHERE workflow_id = ? AND objection_id = ?
+    `).run(status, new Date().toISOString(), workflowId, objectionId);
   }
 
   updatePostReviewStage(workflowId: string, stage: string): void {
@@ -228,12 +253,20 @@ export class PersistenceStore {
   saveAgent(input: AgentInput): void { this.transaction((tx) => tx.saveAgent(input)); }
   saveRequirement(input: RequirementInput): void { this.transaction((tx) => tx.saveRequirement(input)); }
   saveObjection(input: ObjectionInput): void { this.transaction((tx) => tx.saveObjection(input)); }
-  updateObjectionStatus(objectionId: string, status: string): void { this.transaction((tx) => tx.updateObjectionStatus(objectionId, status)); }
+  updateObjectionStatus(workflowId: string, objectionId: string, status: string): void {
+    this.transaction((tx) => tx.updateObjectionStatus(workflowId, objectionId, status));
+  }
   updatePostReviewStage(workflowId: string, stage: string): void { this.transaction((tx) => tx.updatePostReviewStage(workflowId, stage)); }
   saveDecision(input: DecisionInput): void { this.transaction((tx) => tx.saveDecision(input)); }
   saveHumanFeedback(input: HumanFeedbackInput): void { this.transaction((tx) => tx.saveHumanFeedback(input)); }
   saveArtifact(input: ArtifactInput): void { this.transaction((tx) => tx.saveArtifact(input)); }
   recordUsage(input: UsageInput): void { this.transaction((tx) => tx.recordUsage(input)); }
+
+  listHumanFeedback(workflowId: string): ReadonlyArray<Readonly<Row>> {
+    return this.db.prepare(
+      "SELECT * FROM human_feedback WHERE workflow_id = ? ORDER BY created_at ASC",
+    ).all(workflowId) as Row[];
+  }
 
   listEvents(options: { workflowId?: string; afterSequence?: number; limit?: number | null } = {}): StoredEvent[] {
     const where: string[] = [];

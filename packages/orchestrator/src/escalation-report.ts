@@ -1,5 +1,6 @@
 import { parseToon } from "@platform/contracts";
 import type { PersistenceStore } from "@platform/persistence";
+import { repairObjectionProjection } from "./objection-projection.js";
 
 function str(value: unknown): string {
   return value === null || value === undefined ? "" : String(value);
@@ -45,6 +46,8 @@ export function buildStalemateReport(
   objectionIds: readonly string[],
   reason: "objection_stalemate" | "guardrail_conflict" | "plan_churn" = "objection_stalemate",
 ): string {
+  // Heal rows missing because older schemas keyed objections globally by id.
+  repairObjectionProjection(store, workflowId);
   const objectionRows = new Map(store.listObjections(workflowId).map((row) => [str(row.objection_id), row]));
   const events = store.listEvents({ workflowId });
   const addressals = store
@@ -53,9 +56,10 @@ export function buildStalemateReport(
 
   const sections = objectionIds.map((id) => {
     const row = objectionRows.get(id);
+    const eventSeverity = latestRaisedSeverity(events, id);
     const lines: string[] = [
       `### ${id}`,
-      `severity: ${row ? str(row.severity) : "unknown"}`,
+      `severity: ${row ? str(row.severity) : eventSeverity ?? "unknown"}`,
       `raisedBy: ${row ? str(row.raised_by) : "unknown"}`,
       `claim: ${row ? str(row.claim) : "(unavailable)"}`,
     ];
@@ -97,6 +101,19 @@ export function buildStalemateReport(
     header,
     ...sections,
   ].join("\n\n");
+}
+
+function latestRaisedSeverity(
+  events: ReturnType<PersistenceStore["listEvents"]>,
+  objectionId: string,
+): string | null {
+  let severity: string | null = null;
+  for (const entry of events) {
+    if (entry.event.kind !== "ObjectionRaised") continue;
+    const payload = entry.event.payload as { objectionId: string; severity?: string };
+    if (payload.objectionId === objectionId && payload.severity) severity = payload.severity;
+  }
+  return severity;
 }
 
 /**

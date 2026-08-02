@@ -1,7 +1,7 @@
 import { EventSchema, eventId, type EventKind, type PlatformEvent } from "@platform/contracts";
 import { hasOpenObjections, humanRuleAllows, openObjectionIds, stalemateObjectionIds, underIterationCap } from "./guards.js";
 import { foldReducer } from "./fold.js";
-import type { EngineEffect, FoldedState, HumanDecisionInput, TransitionResult, WorkflowEngineConfig, WorkflowPhase } from "./types.js";
+import type { EngineEffect, FoldedState, HumanDecisionInput, ContinueAfterStalemateInput, TransitionResult, WorkflowEngineConfig, WorkflowPhase } from "./types.js";
 
 function asEvent(value: unknown): PlatformEvent {
   return EventSchema.parse(value) as PlatformEvent & { kind: EventKind };
@@ -40,6 +40,7 @@ export type PlanningInput =
   | { type: "frontierReport"; workflowId: string; blocking: boolean; occurredAt?: string }
   | { type: "requestHuman"; workflowId: string }
   | { type: "humanDecision"; input: HumanDecisionInput }
+  | { type: "continueAfterStalemate"; input: ContinueAfterStalemateInput }
   | { type: "blockImplementation"; workflowId: string; reason: string; occurredAt?: string }
   | { type: "setPhase"; workflowId: string; phase: WorkflowPhase };
 
@@ -197,6 +198,32 @@ export function reducePlanning(state: FoldedState, config: WorkflowEngineConfig,
       const folded = foldReducer(state, rejected);
       effects.push({ type: "appendEvent", event: rejected });
       effects.push(persist(decision.workflowId, folded, config, "rejected"));
+      return { accepted: true, state: folded, effects };
+    }
+    case "continueAfterStalemate": {
+      const { input: cont } = input;
+      if (state.phase !== "escalated") {
+        return { accepted: false, state, effects: [], reason: `illegal continueAfterStalemate in ${state.phase}` };
+      }
+      if (cont.objectionIds.length === 0) {
+        return { accepted: false, state, effects: [], reason: "continueAfterStalemate requires at least one objection id" };
+      }
+      const previousThreshold = state.stalemateReraiseThreshold ?? 1;
+      const newThreshold = previousThreshold + 1;
+      const newConfig: WorkflowEngineConfig = { ...config, maxIterations: config.maxIterations + 1 };
+      const event = asEvent({
+        ...eventBase(cont.workflowId, iso(cont.occurredAt)),
+        kind: "StalemateContinued",
+        payload: {
+          objectionIds: cont.objectionIds,
+          previousThreshold,
+          newThreshold,
+          maxIterations: newConfig.maxIterations,
+        },
+      });
+      const folded = foldReducer(state, event);
+      effects.push({ type: "appendEvent", event });
+      effects.push(persist(cont.workflowId, folded, newConfig, "running"));
       return { accepted: true, state: folded, effects };
     }
     case "blockImplementation": {

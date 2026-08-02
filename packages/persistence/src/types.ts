@@ -71,6 +71,7 @@ export type ObjectionInput = {
   claim: string;
   evidence: string[];
   evidenceMissing?: boolean;
+  suggestedResolution?: string | null;
   status: string;
   raisedBy: string;
   clusterId?: string | null;

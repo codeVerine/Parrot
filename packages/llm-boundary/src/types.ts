@@ -90,6 +90,13 @@ export type ObjectionView = {
   claim: string;
   evidence: string[];
   evidence_missing?: boolean;
+  /** Pair-authored fix guideline when present. */
+  suggestedResolution?: string;
+  /** Author addressal retained after resolve for the next Pair prompt. */
+  addressal?: {
+    resolutionStrategy: string;
+    evidence: string;
+  };
   status: ObjectionStatus;
   raisedBy: string;
   turnId: string;
@@ -112,6 +119,10 @@ export type BuildContext = {
   task?: string;
   proposalSummary?: string;
   proposalPath?: string;
+  /** Author must write the new proposal version to this exact path (planner@1.8.0+). */
+  proposalOutputPath?: string;
+  /** SHA-256 of the immutable proposal Pair must review. */
+  proposalHash?: string;
   codebaseContext?: CodebaseContextFile[];
   requirements?: RequirementView[];
   openObjections?: ObjectionView[];
@@ -163,6 +174,13 @@ export type ValidateResultInput = {
   contentHash?: string;
   turn: TurnIdentity & { turnType: TurnType; attempt: "primary" | "repair" };
   expectedRole?: RoleName;
+  /** Persisted pin, e.g. reviewer@1.2.0 — gates semantic rich-field rules. */
+  promptVersion?: string;
+  /** Author: expected turn-local proposal.md path under planner@1.8.0+. */
+  expectedProposalOutputPath?: string;
+  /** Pair: proposal identity that must appear in the rich TOON. */
+  expectedProposalPath?: string;
+  expectedProposalHash?: string;
 };
 
 export type ClusteredObjection = {

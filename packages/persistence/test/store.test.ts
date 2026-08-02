@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { parseToon, RuntimeSignalSchema } from "@platform/contracts";
-import { schemaTables } from "../src/index.js";
+import { CURRENT_SCHEMA_VERSION, MIGRATIONS, schemaTables } from "../src/index.js";
 import { PersistenceStore } from "../src/store.js";
 import { sampleEvent, sampleSignal, seedTurn } from "./helpers.js";
 
@@ -25,6 +29,152 @@ test("persists the Phase 3 tables and keeps structured payloads as TOON", () => 
   assert.deepEqual(parseToon(store.listEvents()[0].payloadToon), { resultHash: "a".repeat(64) });
   assert.equal(store.listSignals()[0].signal.kind, "ResultFileSeen");
   assert.deepEqual(store.pendingDeadlines(), [{ turnId: "turn-1", deadline: "2026-07-19T10:05:00.000Z", attempt: "primary" }]);
+  const feedback = store.listHumanFeedback("workflow-1");
+  assert.equal(feedback.length, 1);
+  assert.equal(String(feedback[0]?.comment), "Proceed.");
+  store.close();
+});
+
+test("same objection id can exist independently on two workflows", () => {
+  const store = new PersistenceStore({ path: ":memory:" });
+  store.transaction((tx) => {
+    tx.saveWorkflow({ workflowId: "workflow-a", workspaceId: "workspace-1", status: "running", task: "a" });
+    tx.saveWorkflow({ workflowId: "workflow-b", workspaceId: "workspace-1", status: "running", task: "b" });
+    tx.saveIteration({ iterationId: "workflow-a-iter-1", workflowId: "workflow-a", iterationNumber: 1, status: "running" });
+    tx.saveIteration({ iterationId: "workflow-b-iter-1", workflowId: "workflow-b", iterationNumber: 1, status: "running" });
+    tx.saveTurn({
+      turnId: "turn-a",
+      workflowId: "workflow-a",
+      iterationId: "workflow-a-iter-1",
+      agentId: "reviewer",
+      state: "completed",
+      attempt: "primary",
+      promptPath: "a/prompt.md",
+      promptHash: "ha",
+      nonce: "na",
+      promptVersion: "reviewer@1",
+      resultPath: "a/result.toon",
+    });
+    tx.saveTurn({
+      turnId: "turn-b",
+      workflowId: "workflow-b",
+      iterationId: "workflow-b-iter-1",
+      agentId: "reviewer",
+      state: "completed",
+      attempt: "primary",
+      promptPath: "b/prompt.md",
+      promptHash: "hb",
+      nonce: "nb",
+      promptVersion: "reviewer@1",
+      resultPath: "b/result.toon",
+    });
+    tx.saveObjection({
+      objectionId: "OBJ-001",
+      workflowId: "workflow-a",
+      iterationId: "workflow-a-iter-1",
+      turnId: "turn-a",
+      dimension: "review",
+      severity: "blocking",
+      claim: "claim from workflow A",
+      evidence: ["a"],
+      status: "open",
+      raisedBy: "reviewer",
+    });
+    tx.saveObjection({
+      objectionId: "OBJ-001",
+      workflowId: "workflow-b",
+      iterationId: "workflow-b-iter-1",
+      turnId: "turn-b",
+      dimension: "review",
+      severity: "major",
+      claim: "claim from workflow B",
+      evidence: ["b"],
+      status: "open",
+      raisedBy: "reviewer",
+    });
+  });
+
+  const a = store.listObjections("workflow-a");
+  const b = store.listObjections("workflow-b");
+  assert.equal(a.length, 1);
+  assert.equal(b.length, 1);
+  assert.equal(a[0]?.claim, "claim from workflow A");
+  assert.equal(b[0]?.claim, "claim from workflow B");
+  assert.equal(a[0]?.severity, "blocking");
+  assert.equal(b[0]?.severity, "major");
+
+  store.updateObjectionStatus("workflow-a", "OBJ-001", "resolved");
+  assert.equal(store.listObjections("workflow-a")[0]?.status, "resolved");
+  assert.equal(store.listObjections("workflow-b")[0]?.status, "open");
+  store.close();
+});
+
+test("objection upsert within a workflow updates claim without leaking across workflows", () => {
+  const store = new PersistenceStore({ path: ":memory:" });
+  store.transaction((tx) => {
+    tx.saveWorkflow({ workflowId: "workflow-a", workspaceId: "workspace-1", status: "running", task: "a" });
+    tx.saveWorkflow({ workflowId: "workflow-b", workspaceId: "workspace-1", status: "running", task: "b" });
+    tx.saveIteration({ iterationId: "workflow-a-iter-1", workflowId: "workflow-a", iterationNumber: 1, status: "running" });
+    tx.saveIteration({ iterationId: "workflow-b-iter-1", workflowId: "workflow-b", iterationNumber: 1, status: "running" });
+    for (const [turnId, workflowId, iterationId] of [
+      ["turn-a", "workflow-a", "workflow-a-iter-1"],
+      ["turn-b", "workflow-b", "workflow-b-iter-1"],
+    ] as const) {
+      tx.saveTurn({
+        turnId,
+        workflowId,
+        iterationId,
+        agentId: "reviewer",
+        state: "completed",
+        attempt: "primary",
+        promptPath: `${turnId}/prompt.md`,
+        promptHash: "h",
+        nonce: "n",
+        promptVersion: "reviewer@1",
+        resultPath: `${turnId}/result.toon`,
+      });
+    }
+    tx.saveObjection({
+      objectionId: "OBJ-002",
+      workflowId: "workflow-a",
+      iterationId: "workflow-a-iter-1",
+      turnId: "turn-a",
+      dimension: "review",
+      severity: "blocking",
+      claim: "original A",
+      evidence: [],
+      status: "resolved",
+      raisedBy: "reviewer",
+    });
+    tx.saveObjection({
+      objectionId: "OBJ-002",
+      workflowId: "workflow-b",
+      iterationId: "workflow-b-iter-1",
+      turnId: "turn-b",
+      dimension: "review",
+      severity: "blocking",
+      claim: "original B",
+      evidence: [],
+      status: "open",
+      raisedBy: "reviewer",
+    });
+    tx.saveObjection({
+      objectionId: "OBJ-002",
+      workflowId: "workflow-a",
+      iterationId: "workflow-a-iter-1",
+      turnId: "turn-a",
+      dimension: "review",
+      severity: "blocking",
+      claim: "re-raised A",
+      evidence: ["new evidence"],
+      status: "open",
+      raisedBy: "reviewer",
+    });
+  });
+
+  assert.equal(store.listObjections("workflow-a")[0]?.claim, "re-raised A");
+  assert.equal(store.listObjections("workflow-a")[0]?.status, "open");
+  assert.equal(store.listObjections("workflow-b")[0]?.claim, "original B");
   store.close();
 });
 
@@ -149,5 +299,65 @@ test("saveDecision stores a schema-validated payload", () => {
     provenance: { iterationId: "iteration-1", objectionIds: [], turnId: "turn-1", workflowId: "workflow-1" },
     reason: "Persist it.",
   });
+  store.close();
+});
+
+test("migration v3 → v4 adds suggested_resolution and round-trips Pair fields", () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "parrot-migrate-v4-")), "parrot.db");
+  const bootstrap = new DatabaseSync(dbPath);
+  bootstrap.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);");
+  for (let version = 1; version <= 3; version += 1) {
+    bootstrap.exec(MIGRATIONS[version - 1]!);
+    bootstrap.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(version, "2026-07-19T10:00:00.000Z");
+  }
+  bootstrap.prepare(`
+    INSERT INTO workflows (workflow_id, workspace_id, status, task, config_toon, state_toon, created_at, updated_at)
+    VALUES ('workflow-1', 'workspace-1', 'running', 'task', '{}', '{}', ?, ?)
+  `).run("2026-07-19T10:00:00.000Z", "2026-07-19T10:00:00.000Z");
+  bootstrap.prepare(`
+    INSERT INTO iterations (iteration_id, workflow_id, iteration_number, status, state_toon, created_at, updated_at)
+    VALUES ('iteration-1', 'workflow-1', 1, 'running', '{}', ?, ?)
+  `).run("2026-07-19T10:00:00.000Z", "2026-07-19T10:00:00.000Z");
+  bootstrap.prepare(`
+    INSERT INTO turns (turn_id, workflow_id, iteration_id, agent_id, state, attempt, deadline_at, prompt_path, prompt_hash, nonce, prompt_version, result_path, created_at, updated_at)
+    VALUES ('turn-1', 'workflow-1', 'iteration-1', 'reviewer', 'completed', 'primary', NULL, 'p.md', 'h', 'n', 'reviewer@1.1.0', 'r.toon', ?, ?)
+  `).run("2026-07-19T10:00:00.000Z", "2026-07-19T10:00:00.000Z");
+  bootstrap.prepare(`
+    INSERT INTO objections (
+      objection_id, workflow_id, iteration_id, turn_id, dimension, severity, claim,
+      evidence_toon, evidence_missing, status, raised_by, cluster_id, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "OBJ-legacy", "workflow-1", "iteration-1", "turn-1", "review", "major",
+    "legacy objection", "[]", 0, "open", "reviewer", null, "2026-07-19T10:00:00.000Z",
+  );
+  bootstrap.close();
+
+  const store = new PersistenceStore({ path: dbPath });
+  const migrated = new DatabaseSync(dbPath).prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number };
+  assert.equal(Number(migrated.version), CURRENT_SCHEMA_VERSION);
+
+  const columns = store.readRows("objections");
+  assert.ok(columns.length >= 1);
+  const legacy = columns.find((row) => String(row.objection_id) === "OBJ-legacy");
+  assert.ok(legacy);
+  assert.equal(legacy?.suggested_resolution, null);
+
+  store.saveObjection({
+    objectionId: "OBJ-rich",
+    workflowId: "workflow-1",
+    iterationId: "iteration-1",
+    turnId: "turn-1",
+    dimension: "review",
+    severity: "blocking",
+    claim: "Missing auth",
+    evidence: ["src/a.ts:1"],
+    status: "open",
+    raisedBy: "reviewer",
+    suggestedResolution: "Add ownership check before delete.",
+  });
+
+  const rich = store.listObjections("workflow-1").find((row) => String(row.objection_id) === "OBJ-rich");
+  assert.equal(String(rich?.suggested_resolution), "Add ownership check before delete.");
   store.close();
 });

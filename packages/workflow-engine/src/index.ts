@@ -27,6 +27,7 @@ export { enterFrontierReview, reducePlanning, type PlanningInput } from "./plann
 export { correlationKey, mapFault, reduceSignal } from "./signals.js";
 export { isOrphanSource, isTerminalTurn, reduceTurn, REPAIR_BOUND, type TurnInput } from "./turn.js";
 export type {
+  ContinueAfterStalemateInput,
   EngineEffect,
   EscalationNotification,
   FoldedObjection,

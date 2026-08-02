@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { agentId, turnId } from "@platform/contracts";
 import { composeProviderReattachArgv, HerdrAgentRuntime } from "../src/runtime.js";
+import { EnterNotAcknowledgedError } from "../src/errors.js";
 import { FakeHerdr } from "./fake-herdr.js";
 
 test("provider reattach argv uses documented session-id forms", () => {
@@ -29,6 +30,20 @@ test("runtime correlates delivery, result hash, and result-file signal", async (
   await writeFile(request.promptPath, "prompt"); const receipt = await runtime.send(handle.id, request); assert.equal(receipt.promptHash, "prompt-hash");
   await writeFile(resultPath, "value: ok\n"); let signal = await runtime.wait(handle.id, id, 500); while (signal.kind !== "ResultFileSeen") signal = await runtime.wait(handle.id, id, 500); assert.equal(signal.kind, "ResultFileSeen");
   const result = await runtime.result(handle.id, id); assert.equal(result.hash.length, 64); assert.equal(result.turnId, id); await runtime.close();
+});
+
+test("an unacknowledged Enter keeps the turn alive and the result watcher completes it", async () => {
+  const fake = new FakeHerdr(); const runtime = new HerdrAgentRuntime({ client: fake, config: { turnDeadlineMs: 500, operationTimeoutMs: 100, pollIntervalMs: 5 } });
+  const handle = await runtime.start({ id: agentId("agent-unacked"), provider: "claude", role: "planner", workspaceId: "workspace-1", worktreeRequired: false });
+  fake.sendAgent = async () => { throw new EnterNotAcknowledgedError("Enter not acknowledged: pane test"); };
+  const dir = await mkdtemp(join(tmpdir(), "herdr-unacked-")); await mkdir(join(dir, "turn"));
+  const id = turnId("turn-unacked"); const resultPath = join(dir, "turn", "result.toon"); const request = { turnId: id, workflowId: "workspace-1", iterationId: "iteration-1", promptPath: join(dir, "prompt.md"), promptHash: "prompt-hash", resultPath, schemaId: "planner", nonce: "nonce", deadline: new Date(Date.now() + 500) };
+  await writeFile(request.promptPath, "prompt");
+  const receipt = await runtime.send(handle.id, request);
+  assert.equal(receipt.startConfirmed, false, "the receipt should report the unconfirmed start");
+  await writeFile(resultPath, "value: ok\n");
+  let signal = await runtime.wait(handle.id, id, 500); while (signal.kind !== "ResultFileSeen") signal = await runtime.wait(handle.id, id, 500);
+  const result = await runtime.result(handle.id, id); assert.equal(result.turnId, id); await runtime.close();
 });
 
 test("runtime waits for a newly spawned agent to become ready", async () => {
@@ -145,6 +160,49 @@ test("a past-due turn emits DeadlineExpired instead of a watch fault", async () 
   await runtime.close();
 });
 
+test("idle deadline rearms while Herdr still reports working", async () => {
+  const fake = new FakeHerdr();
+  const runtime = new HerdrAgentRuntime({
+    client: fake,
+    config: { operationTimeoutMs: 100, pollIntervalMs: 5 },
+  });
+  const handle = await runtime.start({
+    id: agentId("agent-idle-rearm"),
+    provider: "codex",
+    role: "planner",
+    workspaceId: "workspace-1",
+    worktreeRequired: false,
+  });
+  const dir = await mkdtemp(join(tmpdir(), "herdr-idle-rearm-"));
+  await mkdir(join(dir, "turn"));
+  const resultPath = join(dir, "turn", "result.toon");
+  await runtime.send(handle.id, {
+    turnId: turnId("turn-idle-rearm"),
+    workflowId: "workspace-1",
+    iterationId: "iteration-1",
+    promptPath: join(dir, "prompt.md"),
+    promptHash: "hash",
+    resultPath,
+    schemaId: "planner",
+    nonce: "nonce",
+    deadline: new Date(Date.now() + 2_000),
+    idleMs: 40,
+  });
+  // Keep the agent "working" with no turn-dir writes; the idle timer must rearm.
+  fake.setStatus(handle.paneId, "working");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(
+    runtime.getSignals().filter((signal) => signal.kind === "DeadlineExpired").length,
+    0,
+    "working agent must not expire on idle silence alone",
+  );
+  // Flip to idle+silent: next idle tick should expire.
+  fake.setStatus(handle.paneId, "idle");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(runtime.getSignals().some((signal) => signal.kind === "DeadlineExpired"), true);
+  await runtime.close();
+});
+
 test("reading a result allows the next turn and prunes the old context", async () => {
   const fake = new FakeHerdr(); const runtime = new HerdrAgentRuntime({ client: fake, config: { operationTimeoutMs: 100, pollIntervalMs: 5 } });
   const handle = await runtime.start({ id: agentId("agent-prune"), provider: "codex", role: "reviewer", workspaceId: "workspace-1", worktreeRequired: false });
@@ -154,6 +212,50 @@ test("reading a result allows the next turn and prunes the old context", async (
   let signal = await runtime.wait(handle.id, first.turnId, 500); while (signal.kind !== "ResultFileSeen") signal = await runtime.wait(handle.id, first.turnId, 500);
   await runtime.result(handle.id, first.turnId);
   await runtime.send(handle.id, { ...first, turnId: turnId("turn-prune-2"), resultPath: join(dir, "turn", "result-2.toon") });
+  await runtime.close();
+});
+
+test("next send succeeds after a prior turn left identity status blocked", async () => {
+  // Codex permission prompts set Herdr status to blocked. pruneReadTurns resets
+  // the map entry to idle via setStatus (new object); send must re-read that
+  // entry instead of trusting a pre-prune identity snapshot.
+  const fake = new FakeHerdr();
+  const runtime = new HerdrAgentRuntime({ client: fake, config: { operationTimeoutMs: 100, pollIntervalMs: 5 } });
+  const handle = await runtime.start({
+    id: agentId("agent-blocked-stale"),
+    provider: "codex",
+    role: "reviewer",
+    workspaceId: "workspace-1",
+    worktreeRequired: false,
+  });
+  const dir = await mkdtemp(join(tmpdir(), "herdr-blocked-stale-"));
+  await mkdir(join(dir, "turn"));
+  const first = {
+    turnId: turnId("turn-blocked-1"),
+    workflowId: "workspace-1",
+    iterationId: "iteration-1",
+    promptPath: join(dir, "prompt.md"),
+    promptHash: "hash",
+    resultPath: join(dir, "turn", "result.toon"),
+    schemaId: "reviewer",
+    nonce: "nonce",
+    deadline: new Date(Date.now() + 1_000),
+  };
+  await runtime.send(handle.id, first);
+  fake.setStatus(handle.paneId, "blocked");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(runtime.identity.get(handle.id)?.status, "blocked");
+  await writeFile(first.resultPath, "value: one\n");
+  let signal = await runtime.wait(handle.id, first.turnId, 500);
+  while (signal.kind !== "ResultFileSeen") signal = await runtime.wait(handle.id, first.turnId, 500);
+  await runtime.result(handle.id, first.turnId);
+  assert.equal(runtime.identity.get(handle.id)?.status, "blocked", "status stays blocked until the next send prunes");
+  await runtime.send(handle.id, {
+    ...first,
+    turnId: turnId("turn-blocked-2"),
+    resultPath: join(dir, "turn", "result-2.toon"),
+  });
+  assert.equal(runtime.identity.get(handle.id)?.status, "working");
   await runtime.close();
 });
 

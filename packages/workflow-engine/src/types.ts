@@ -75,6 +75,18 @@ export type FoldedState = {
   orphanLinks: readonly OrphanLink[];
   budgetCapReached: boolean;
   iterationCapReached: boolean;
+  /**
+   * Open objections with `reraiseCount >= stalemateReraiseThreshold` trip a stalemate.
+   * Starts at 1; each human "continue planning" choice increments it by 1.
+   */
+  stalemateReraiseThreshold: number;
+};
+
+export type ContinueAfterStalemateInput = {
+  workflowId: string;
+  objectionIds: string[];
+  comment?: string;
+  occurredAt?: string;
 };
 
 export type TurnRecord = {

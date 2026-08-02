@@ -1,5 +1,5 @@
 import type { AgentId, TurnId } from "@platform/contracts";
-import type { AgentHandle, HerdrAgentRuntime, TurnRequest } from "@platform/herdr-adapter";
+import { ArtifactRejectedError, type AgentHandle, type HerdrAgentRuntime, type TurnRequest } from "@platform/herdr-adapter";
 import type { AgentRunner, AgentTurnRequest } from "./runner.js";
 
 export type HerdrRunnerOptions = {
@@ -12,6 +12,8 @@ export type HerdrRunnerOptions = {
   idleTimeoutMs?: number;
   /** @deprecated alias for `maxMs`. */
   timeoutMs?: number;
+  /** Operator-facing advisory messages (e.g. delivery confirmed but start unconfirmed). */
+  onNotice?: (message: string) => void;
 };
 
 /**
@@ -20,9 +22,9 @@ export type HerdrRunnerOptions = {
  * turn engine; the runner only returns raw result text.
  *
  * Timeout is idle-based, not wall-clock: a turn fails after `idleTimeoutMs` of no
- * result-dir activity (reset on each write by the runtime), bounded by an absolute
- * `maxMs` cap. This keeps a long but actively-working agent alive while still
- * failing a genuinely stalled one.
+ * result-dir activity **and** no live Herdr working/blocked status (each resets the
+ * idle timer), bounded by an absolute `maxMs` cap. This keeps a long but actively
+ * working agent alive while still failing a genuinely stalled one.
  */
 export function createHerdrRunner(options: HerdrRunnerOptions): AgentRunner {
   const maxMs = options.maxMs ?? options.timeoutMs ?? 45 * 60 * 1000;
@@ -46,7 +48,14 @@ export function createHerdrRunner(options: HerdrRunnerOptions): AgentRunner {
         idleMs,
         attempt: request.attempt,
       };
-      await options.runtime.send(agentId, turnRequest);
+      const receipt = await options.runtime.send(agentId, turnRequest);
+      if (!receipt.startConfirmed) {
+        options.onNotice?.(
+          `[${handle.role}] ${handle.provider} (pane ${handle.paneId}) has not confirmed it started working. ` +
+          `If its pane shows activity, Parrot keeps waiting for the result (idle cutoff ${Math.round(idleMs / 1000)}s while silent+idle, cap ${Math.round(maxMs / 60000)}min); ` +
+          `otherwise press Ctrl+C and resume with --resume.`,
+        );
+      }
       await options.runtime.wait(agentId, turnId, maxMs);
       try {
         const result = await options.runtime.result(agentId, turnId);
@@ -54,7 +63,15 @@ export function createHerdrRunner(options: HerdrRunnerOptions): AgentRunner {
       } catch (error) {
         if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
           throw new Error(
-            `Agent ${request.agentId} did not write ${request.resultPath}: no result-dir activity for ${Math.round(idleMs / 1000)}s (idle cutoff), within a ${Math.round(maxMs / 60000)}min cap. The prompt may never have been submitted, or the agent stalled.`,
+            `Agent ${request.agentId} did not write ${request.resultPath}: no result-dir activity and Herdr not working/blocked for ${Math.round(idleMs / 1000)}s (idle cutoff), within a ${Math.round(maxMs / 60000)}min cap. The prompt may never have been submitted, or the agent stalled.`,
+          );
+        }
+        if (error instanceof ArtifactRejectedError) {
+          throw new Error(
+            `Agent ${request.agentId} wrote a result Parrot cannot accept (${error.reason}) at ${error.artifactPath}.` +
+              (error.reason === "stale_mtime"
+                ? " The file looks older than this turn's prompt — usually a leftover from a failed attempt; retry or resume after the agent rewrites result.toon."
+                : " Check permissions, path, and size, then resume."),
           );
         }
         throw error;

@@ -15,6 +15,36 @@ import type {
 } from "../types.js";
 import { RolePromptRegistry, builtinRolePromptRegistry } from "./registry.js";
 
+function displayTurnTitle(turnType: TurnType): string {
+  switch (turnType) {
+    case "planner_propose":
+      return "Author Propose";
+    case "planner_revise":
+      return "Author Revise";
+    case "reviewer_review":
+      return "Pair Review";
+    case "adversarial_review":
+      return "Pair Adversarial Review";
+    case "resolution_verification":
+      return "Resolution Verification";
+    case "objection_merge":
+      return "Objection Merge";
+    case "compacted_state_refresh":
+      return "Compacted State Refresh";
+    case "frontier_report":
+      return "Frontier Report";
+    case "implementation":
+      return "Implementation";
+    case "repair":
+      return "Repair";
+    default: {
+      const _exhaustive: never = turnType;
+      void _exhaustive;
+      return "Turn";
+    }
+  }
+}
+
 export type PromptBuilderOptions = {
   config: LlmBoundaryConfig;
   registry?: RolePromptRegistry;
@@ -195,7 +225,7 @@ function renderPrompt(args: {
   const { turnType, rolePromptBody, identity, context, collectUntrusted } = args;
   const sentinel = identity.nonce;
   const lines: string[] = [
-    `# ${titleFor(turnType)}`,
+    `# ${displayTurnTitle(turnType)}`,
     "",
     "## Role instructions",
     rolePromptBody,
@@ -217,6 +247,17 @@ function renderPrompt(args: {
   }
   if (context.proposalPath) {
     lines.push(`## Proposal path`, context.proposalPath, "");
+  }
+  if (context.proposalOutputPath) {
+    lines.push(
+      "## Proposal output path",
+      "Write the new Author proposal version to this exact path (do not overwrite a prior version path):",
+      context.proposalOutputPath,
+      "",
+    );
+  }
+  if (context.proposalHash) {
+    lines.push(`## Proposal hash`, context.proposalHash, "");
   }
   if (context.proposalSummary) {
     collectUntrusted(context.proposalSummary);
@@ -267,7 +308,10 @@ function renderPrompt(args: {
   }
 
   if (context.humanMessages?.length) {
-    lines.push("## Human messages");
+    lines.push(
+      "## Human guidance",
+      "Treat the following as binding human architecture directions for this turn.",
+    );
     for (const message of context.humanMessages) {
       collectUntrusted(message.message);
       lines.push(
@@ -307,6 +351,7 @@ function renderPrompt(args: {
     `1. Write TOON to a temp file, then rename to: ${context.resultPath}`,
     "2. Envelope fields must match the turn identity and nonce above.",
     "3. Do not write markdown or JSON into result.toon.",
+    "4. TOON arrays are one header with row count N, then exactly N data rows. Example: citations[2]{...}: followed by two rows. Never emit citations[1], citations[2], ... as separate keys.",
     "",
     "```toon",
     encodeToon(exampleEnvelope(turnType, identity)),
@@ -330,6 +375,19 @@ function renderObjectionEvidence(
     `status: ${objection.status}`,
     evidenceBlock(sentinel, objection.id, "claim", objection.claim),
   ];
+  if (objection.suggestedResolution?.trim()) {
+    collectUntrusted(objection.suggestedResolution);
+    lines.push(
+      evidenceBlock(sentinel, objection.id, "suggestedResolution", objection.suggestedResolution),
+    );
+  }
+  if (objection.addressal) {
+    collectUntrusted(objection.addressal.evidence);
+    lines.push(`addressalStrategy: ${objection.addressal.resolutionStrategy}`);
+    lines.push(
+      evidenceBlock(sentinel, objection.id, "addressalEvidence", objection.addressal.evidence),
+    );
+  }
   if (objection.evidence.length === 0) {
     lines.push("evidence_missing: true");
   } else {
@@ -362,13 +420,6 @@ function renderCodebaseContext(
   return lines;
 }
 
-function titleFor(turnType: TurnType): string {
-  return turnType
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
 function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<string, unknown> {
   const base = {
     workflowId: identity.workflowId,
@@ -386,14 +437,28 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
         role: "planner",
         payload: {
           role: "planner",
-          proposalPath: "path/to/proposal.md",
-          summary: "Short summary.",
+          proposalPath: "runs/wf/it/turn/proposal.md",
+          summary: "Short Author summary of the proposal.",
           objectionsAddressed: [
             {
               objectionId: "OBJ-1",
               resolutionStrategy: "revised_plan",
               evidence: "Exact quote from proposal.md or pasted code.",
               requiresGuardrailException: false,
+            },
+          ],
+          citations: [
+            {
+              path: "packages/example/src/api.ts",
+              startLine: 10,
+              endLine: 12,
+              quote: "export function exampleApi() { return 42; }",
+            },
+            {
+              path: "packages/example/src/store.ts",
+              startLine: 4,
+              endLine: 6,
+              quote: "export function loadState(): State {",
             },
           ],
         },
@@ -403,7 +468,22 @@ function exampleEnvelope(turnType: TurnType, identity: TurnIdentity): Record<str
       return {
         ...base,
         role: "reviewer",
-        payload: { role: "reviewer", objections: [], cleanRationale: "The plan satisfies criterion X because ... and guardrail Y because ..." },
+        payload: {
+          role: "reviewer",
+          reviewedProposalPath: "runs/wf/it/turn/proposal.md",
+          reviewedProposalHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          summary: "Pair review summary of strengths and remaining risks.",
+          objections: [
+            {
+              id: "OBJ-1",
+              severity: "major",
+              claim: "Missing verification for X.",
+              evidence: ["proposal.md:12"],
+              suggestedResolution: "Add a concrete test or gate that proves X before merge.",
+            },
+          ],
+          cleanRationale: "Omit when objections is non-empty; required when objections is empty.",
+        },
       };
     case "resolution_verification":
       return {

@@ -1,6 +1,6 @@
 import type { HerdrCli } from "../src/client/cli.js";
 import type { HerdrClient } from "../src/client/socket.js";
-import { HERDR_EVENT_TYPES, type AgentStartSpec, type HerdrAgent, type HerdrEvent, type HerdrSchema, type HerdrSnapshot, type IntegrationStatus, type PaneReadResult } from "../src/client/types.js";
+import { HERDR_EVENT_TYPES, type AgentStartSpec, type CreatedTab, type HerdrAgent, type HerdrEvent, type HerdrSchema, type HerdrSnapshot, type IntegrationStatus, type PaneReadResult } from "../src/client/types.js";
 
 /**
  * In-memory stand-in for a live Herdr daemon. It speaks the same {@link HerdrClient}
@@ -30,15 +30,19 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   async integrationStatus(_timeoutMs: number): Promise<IntegrationStatus> {
     return { integrations: ["claude", "codex"].filter((name) => !this.missingIntegrations.includes(name)).map((name) => ({ name, installed: true })) };
   }
-  readonly createdTabs: Array<{ workspaceId: string | null; label: string | null }> = [];
+  readonly createdTabs: Array<{ workspaceId: string | null; label: string | null; tabId: string; rootPaneId: string }> = [];
+  readonly closedPanes: string[] = [];
   private tabCounter = 0;
-  async createTab(workspaceId: string | null, label: string | null, _timeoutMs: number): Promise<string> {
-    this.createdTabs.push({ workspaceId, label });
-    return `tab-${++this.tabCounter}`;
+  async createTab(workspaceId: string | null, label: string | null, _timeoutMs: number): Promise<CreatedTab> {
+    const tabId = `tab-${++this.tabCounter}`;
+    const rootPaneId = `root-${this.tabCounter}`;
+    this.createdTabs.push({ workspaceId, label, tabId, rootPaneId });
+    return { tabId, rootPaneId };
   }
   async startAgent(spec: AgentStartSpec, _timeoutMs: number): Promise<HerdrAgent> {
     if (this.failStart) throw new Error("fake spawn failed");
     const provider = spec.argv[0] ?? spec.name;
+    // Mirror Herdr 0.7.3: agent.start with a tab always lands in a new split pane.
     const agent: HerdrAgent = { pane_id: `pane-${++this.paneCounter}`, workspace_id: spec.workspace_id ?? "workspace-1", agent: provider, name: spec.name, agent_status: this.startStatus, agent_session_id: `session-${this.paneCounter}`, agent_session_path: `/tmp/session-${this.paneCounter}` };
     this.agents.set(agent.pane_id, agent); return agent;
   }
@@ -69,7 +73,10 @@ export class FakeHerdr implements HerdrClient, HerdrCli {
   }
   async waitAgent(paneId: string, _timeoutMs: number) { return this.agents.get(paneId) ?? null; }
   async interruptAgent(_paneId: string, _timeoutMs: number) {}
-  async stopAgent(_paneId: string, _timeoutMs: number) {}
+  async stopAgent(paneId: string, _timeoutMs: number) {
+    this.closedPanes.push(paneId);
+    this.agents.delete(paneId);
+  }
   async sessionSnapshot(_timeoutMs: number): Promise<HerdrSnapshot> { if (this.failSnapshot) throw new Error("snapshot failed"); return { protocol: 16, workspace_id: "workspace-1", agents: [...this.agents.values()] }; }
   async listAgents(_timeoutMs: number) {
     if (this.failSnapshot) throw new Error("list failed");

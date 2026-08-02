@@ -73,8 +73,17 @@ export class ResultFileWatcher {
     while (!this.stopped && Date.now() < deadline) {
       try { return await readSafeArtifact(this.resultPath, this.config); }
       catch (error) {
-        if (error instanceof ArtifactRejectedError) { this.emitArtifactRejected(error); throw error; }
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new ResultWatchError(this.resultPath, error instanceof Error ? error.message : String(error));
+        // A leftover primary result.toon is expected after repair bumps sentAtMs.
+        // Treat it like "not ready yet" and keep waiting for a fresh write — do not
+        // emit ArtifactRejected / wake the turn waiter, or repair dies on the old file.
+        if (error instanceof ArtifactRejectedError && error.reason === "stale_mtime") {
+          // fall through to waitForWakeup
+        } else if (error instanceof ArtifactRejectedError) {
+          this.emitArtifactRejected(error);
+          throw error;
+        } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new ResultWatchError(this.resultPath, error instanceof Error ? error.message : String(error));
+        }
       }
       const remaining = Math.min(this.config.pollIntervalMs, deadline - Date.now());
       await this.waitForWakeup(Math.max(1, remaining));

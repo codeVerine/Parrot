@@ -9,10 +9,11 @@ The current packaged runtime lives in `packages/orchestrator`. It supports:
 
 - schema-validated TOON results with one bounded repair attempt;
 - a SQLite event log, replay, and interrupted-workflow resume;
-- planner, reviewer, frontier, implementation, and verifier roles;
+- Author, Pair, frontier, implementation, and verifier roles;
 - objection stalemate and guardrail-conflict escalation;
 - frontier re-review after a materially restructured proposal;
-- bounded, injection-delimited codebase context;
+- machine-verified planner code citations (path, line range, exact quote);
+- bounded, injection-delimited codebase context seeding;
 - workflow-scoped provider sessions with supported session reattachment;
 - a shared isolated git worktree for implementation and verification; and
 - concise per-turn progress in the operator terminal.
@@ -20,6 +21,13 @@ The current packaged runtime lives in `packages/orchestrator`. It supports:
 Plan-churn detection is deliberately deferred: its compatibility configuration
 is accepted but ignored until a real-corpus heuristic is reliable. See
 [Phase 12](docs/phases/phase-12-plan-churn-and-frontier-reinvoke.md).
+
+Author is the sole writer of each turn-local `proposal.md`. Pair reviews that
+exact file by path and SHA-256 hash, then returns compact TOON feedback with a
+summary and a concrete suggested resolution for every objection. Pair never
+overwrites the proposal; Author integrates or explicitly rejects each open
+objection on the next revision. The human decision prompt shows both summaries
+and suggested fixes before approval.
 
 ## Requirements
 
@@ -121,9 +129,10 @@ PARROT_RESUME=wf-123 parrot
 ```
 
 Resume folds the stored event log, restores persisted objections and proposal
-state, adopts a completed late result only after identity and semantic
-validation, and reattaches provider sessions when their installed CLI exposes a
-documented session-id option.
+state, and adopts a completed late result only after identity, semantic, and
+completion-hash validation. Implementation reuse must also match the persisted
+approved-proposal path and hash. Provider sessions are reattached when their
+installed CLI exposes a documented session-id option.
 
 ## Runtime files
 
@@ -137,7 +146,7 @@ runs/
         └── <turn-id>/
             ├── prompt.md
             ├── result.toon
-            └── proposal.md       # planner turns
+            └── proposal.md       # Author turns
 ```
 
 `runs/` is ignored by git. The SQLite database is the durable source of truth;
@@ -204,11 +213,18 @@ The CLI reads configuration from environment variables:
 | `PARROT_TURN_IDLE_TIMEOUT_MS` | Idle timeout, reset by agent activity | runner default |
 | `PARROT_TURN_MAX_MS` | Absolute turn deadline | runner default |
 | `PARROT_TURN_TIMEOUT_MS` | Deprecated absolute-deadline alias | unset |
+| `PARROT_PERMISSION_MODE` | Provider tool approval: `project` (auto inside agent cwd), `ask` (prompt everything), `bypass` (host-wide skip) | `project` |
 | `HERDR_BIN` | Herdr executable | `herdr` |
 | `HERDR_SOCKET` | Explicit daemon socket path | discovered socket, then default socket |
 
 Invalid context-limit values are ignored. `PARROT_TURN_MAX_MS` takes precedence
 over the deprecated `PARROT_TURN_TIMEOUT_MS`.
+
+By default (`PARROT_PERMISSION_MODE=project`) agents auto-approve file work
+inside their cwd (the target repo, or the workflow worktree for implementation /
+verifier). Paths outside that tree still require approval on Claude and Gemini;
+Codex keeps a workspace-write sandbox and denies out-of-workspace writes instead
+of prompting. Use `ask` for stock prompts, or `bypass` for full host skip.
 
 The library packages expose additional typed configuration objects. See
 [Configuration](docs/CONFIGURATION.md).
@@ -267,5 +283,5 @@ composition root.
   historical design baseline
 - `approved-plans/`, immutable planning evidence retained for audit
 
-Parrot is currently a private `0.1.0` workspace and does not publish packages to
+Parrot is currently a public `0.1.0` workspace and does not publish packages to
 a registry.
